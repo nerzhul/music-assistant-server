@@ -67,6 +67,7 @@ if TYPE_CHECKING:
 
 DEFAULT_SERVER_PORT = 8095
 CONF_BASE_URL = "base_url"
+CONF_CALLBACK_URL = "callback_url"
 CONF_ENABLE_SSL = "enable_ssl"
 CONF_SSL_CERTIFICATE = "ssl_certificate"
 CONF_SSL_PRIVATE_KEY = "ssl_private_key"
@@ -103,6 +104,14 @@ class WebserverController(CoreController):
         if config is None:
             return ""
         return str(config.get_value(CONF_BASE_URL)).removesuffix("/")
+    
+    @property
+    def callback_url(self) -> str:
+        """Return the callback URL for authentication providers."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return ""
+        return str(config.get_value(CONF_CALLBACK_URL)).removesuffix("/")
 
     async def get_config_entries(
         self,
@@ -148,6 +157,20 @@ class WebserverController(CoreController):
                 "the webserver behind a reverse proxy.",
                 requires_reload=False,
             ),
+            ConfigEntry(
+                key=CONF_CALLBACK_URL,
+                type=ConfigEntryType.STRING,
+                default_value=default_base_url,
+                label="Authentication Callback URL",
+                description="The URL that authentication providers should redirect to "
+                "after successful authentication. \n"
+                "This is used for external clients (like Spotify) that need to redirect "
+                "back to Music Assistant after login. \n"
+                "In most cases this should be left at the default value, but you may "
+                "need to adjust this if you're running behind a reverse proxy or have a "
+                "custom network setup.",
+                requires_reload=False,
+            )
             ConfigEntry(
                 key=CONF_BIND_PORT,
                 type=ConfigEntryType.INTEGER,
@@ -320,6 +343,7 @@ class WebserverController(CoreController):
         else:
             ingress_tcp_site_params = None
         base_url = str(config.get_value(CONF_BASE_URL))
+        callback_url = str(config.get_value(CONF_CALLBACK_URL))
         port_value = config.get_value(CONF_BIND_PORT)
         assert isinstance(port_value, int)
         self.publish_port = port_value
@@ -355,6 +379,20 @@ class WebserverController(CoreController):
                 base_url,
             )
 
+        if callback_url != base_url:
+            self.logger.info(
+                "\n"
+                "################################################################################\n"
+                "\n"
+                "Callback URL is different from the base URL: %s\n"
+                "\n"
+                "If this address is incorrect, see the documentation on how to configure\n"
+                "the Webserver in Settings --> Core modules --> Webserver\n"
+                "\n"
+                "################################################################################\n",
+                callback_url,
+            )
+
         # Create SSL context if SSL is enabled
         ssl_context = None
         ssl_enabled = config.get_value(CONF_ENABLE_SSL, False)
@@ -369,6 +407,7 @@ class WebserverController(CoreController):
             bind_ip=bind_ip,
             bind_port=self.publish_port,
             base_url=base_url,
+            callback_url=callback_url,
             static_routes=routes,
             # add assets subdir as static_content
             static_content=("/assets", os.path.join(frontend_dir, "assets"), "assets"),

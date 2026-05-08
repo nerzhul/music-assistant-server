@@ -48,6 +48,7 @@ class Webserver:
         bind_ip: str | None,
         bind_port: int,
         base_url: str,
+        callback_url: str,
         static_routes: list[tuple[str, str, Handler]] | None = None,
         static_content: tuple[str, str, str] | None = None,
         ingress_tcp_site_params: tuple[str, int] | None = None,
@@ -59,6 +60,7 @@ class Webserver:
         :param bind_ip: IP address to bind to.
         :param bind_port: Port to bind to.
         :param base_url: Base URL for the server.
+        :param callback_url: Callback URL for the server.
         :param static_routes: List of static routes to register.
         :param static_content: Tuple of (path, directory, name) for static content.
         :param ingress_tcp_site_params: Tuple of (host, port) for ingress TCP site.
@@ -66,6 +68,7 @@ class Webserver:
         :param ssl_context: Optional SSL context for HTTPS support.
         """
         self._base_url = base_url.removesuffix("/")
+        self._callback_url = callback_url.removesuffix("/")
         self._bind_port = bind_port
         self._static_routes = static_routes
         self._webapp = web.Application(
@@ -141,6 +144,11 @@ class Webserver:
     def base_url(self) -> str:
         """Return the base URL of this webserver."""
         return self._base_url
+
+    @property
+    def callback_url(self) -> str:
+        """Return the callback URL of this webserver."""
+        return self._callback_url
 
     @property
     def port(self) -> int | None:

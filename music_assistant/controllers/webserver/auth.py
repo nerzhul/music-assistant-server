@@ -1241,7 +1241,7 @@ class AuthenticationManager:
             return None
 
         # Build callback redirect_uri
-        redirect_uri = f"{self.webserver.base_url}/auth/callback?provider_id={provider_id}"
+        redirect_uri = f"{self.webserver.callback_url}/auth/callback?provider_id={provider_id}"
         return await provider.get_authorization_url(redirect_uri, return_url)
 
     async def handle_oauth_callback(
