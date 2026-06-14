@@ -122,7 +122,7 @@ pub async fn run(config: MassConfig) -> anyhow::Result<()> {
     let player_controller = Arc::new(PlayerController::new());
     let auth = crate::auth::AuthManager::new();
     let registry = ma_providers::provider::ProviderRegistry::new();
-    register_builtin_providers(&registry, &config).await;
+    register_builtin_providers(&registry, &player_controller, &config).await;
     info!(providers = registry.list().len(), "providers registered");
     let registry_arc = registry;
 
@@ -254,6 +254,7 @@ pub async fn run(config: MassConfig) -> anyhow::Result<()> {
 /// set).
 async fn register_builtin_providers(
     registry: &ma_providers::provider::ProviderRegistry,
+    player_controller: &Arc<PlayerController>,
     _config: &MassConfig,
 ) {
     if let Ok(path) = std::env::var("MA_FS_PATH") {
@@ -399,9 +400,11 @@ async fn register_builtin_providers(
     }
 
     // Home Assistant: discover media_player.* entities and expose
-    // them as MA players. The actual player registration happens
-    // later in `state.ha_players` once the discovery loop returns a
-    // snapshot; we just kick the loop here.
+    // them as MA players. The discovery loop polls HA every
+    // `MA_HA_POLL_SECS` seconds (default 30s); a separate consumer
+    // task listens on the `Discover::subscribe()` channel, creates
+    // / updates `HaPlayer` instances, and registers them in the
+    // `PlayerController`.
     let ha_cfg = ma_ha::HaConfig::default();
     if (ha_cfg.url.is_some() && ha_cfg.token.is_some()) || ha_cfg.supervisor_url.is_some() {
         match ma_ha::HaClient::from_config(&ha_cfg) {
@@ -417,6 +420,14 @@ async fn register_builtin_providers(
                         let _handle = discover
                             .clone()
                             .spawn(std::time::Duration::from_secs(poll_secs));
+                        // Consumer task: register / update HA players in
+                        // the controller.
+                        let rx = discover.subscribe();
+                        let ctrl = Arc::clone(player_controller);
+                        let client_for_consumer = Arc::clone(&client);
+                        tokio::spawn(async move {
+                            consume_ha_snapshots(rx, ctrl, client_for_consumer).await;
+                        });
                         tracing::info!(
                             url = ha_cfg.url.as_deref().unwrap_or("(supervisor)"),
                             poll_secs,
@@ -429,4 +440,79 @@ async fn register_builtin_providers(
             Err(e) => tracing::warn!(error = %e, "ha client init failed"),
         }
     }
+}
+
+/// Consume HA discovery snapshots, reconciling `HaPlayer` instances
+/// in the `PlayerController`. We diff the new snapshot against the
+/// current set of registered HA players: new entity ids are added,
+/// removed entity ids are unregistered. Every entity is then
+/// `update_from_entity`'d so the latest snapshot's `state` /
+/// `volume` / etc. surface immediately.
+async fn consume_ha_snapshots(
+    rx: ma_ha::DiscoverRx,
+    ctrl: Arc<PlayerController>,
+    client: Arc<ma_ha::HaClient>,
+) {
+    while let Ok(snapshot) = rx.recv().await {
+        let new_ids: std::collections::HashSet<String> = snapshot
+            .iter()
+            .map(|s| s.entity.entity_id.clone())
+            .collect();
+        // Register new entities.
+        for s in &snapshot {
+            let id = &s.entity.entity_id;
+            let already = ctrl
+                .ha_players
+                .read()
+                .contains_key(&ma_core::identifiers::PlayerId::from(id.clone()));
+            if already {
+                // Refresh the existing player in place.
+                if let Some(player) = ctrl
+                    .ha_players
+                    .read()
+                    .get(&ma_core::identifiers::PlayerId::from(id.clone()))
+                    .cloned()
+                {
+                    player.update_from_entity(&s.entity);
+                }
+            } else {
+                let friendly = friendly_name(&s.entity);
+                let player = ma_ha::HaPlayer::new(id.clone(), friendly, Arc::clone(&client));
+                player.update_from_entity(&s.entity);
+                ctrl.register_ha_player(id, player);
+            }
+        }
+        // Unregister entities that disappeared.
+        let current_ids: Vec<String> = ctrl
+            .ha_players
+            .read()
+            .keys()
+            .map(|k| k.to_string())
+            .collect();
+        for id in current_ids {
+            if !new_ids.contains(&id) {
+                ctrl.unregister_ha_player(&id);
+                tracing::info!(entity_id = %id, "ha player unregistered");
+            }
+        }
+    }
+    tracing::info!("ha snapshot consumer exiting (channel closed)");
+}
+
+/// Pull a friendly display name from the entity's attributes
+/// (`friendly_name` is the standard HA attribute). Falls back to the
+/// `entity_id` minus the domain prefix.
+fn friendly_name(entity: &ma_ha::client::HaEntity) -> String {
+    let attrs = entity.attributes.as_object();
+    if let Some(name) = attrs
+        .and_then(|a| a.get("friendly_name"))
+        .and_then(|v| v.as_str())
+    {
+        return name.to_string();
+    }
+    entity
+        .entity_id
+        .split_once('.')
+        .map(|(_, rest)| rest.replace('_', " "))
+        .unwrap_or_else(|| entity.entity_id.clone())
 }

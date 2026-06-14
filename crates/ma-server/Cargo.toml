@@ -58,3 +58,6 @@ tower = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
+axum = { workspace = true }
+async-channel = "2"
+parking_lot = { workspace = true }

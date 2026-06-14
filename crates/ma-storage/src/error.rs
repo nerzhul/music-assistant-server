@@ -20,6 +20,8 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("query helper error: {0}")]
+    Query(String),
 }
 
 pub type StorageResult<T> = std::result::Result<T, StorageError>;

@@ -24,7 +24,7 @@ use ma_providers::provider::{MusicProvider, ProviderError, ProviderHandle, Resul
 use ma_providers::stream::{StreamAudioFormat, StreamDetails};
 
 use crate::manifest::ytmusic_manifest;
-use crate::parser::{best_audio_format, best_thumbnail, playlist_from_info, track_from_video};
+use crate::parser::{best_thumbnail, playlist_from_info, track_from_video};
 use crate::yt_dlp::{Ytdlp, YtdlpError, YtdlpOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,15 +170,69 @@ impl MusicProvider for YTMusicProviderImpl {
 
     async fn search(
         &self,
-        _query: &str,
-        _media_types: &[MediaType],
-        _limit: u32,
+        query: &str,
+        media_types: &[MediaType],
+        limit: u32,
     ) -> Result<SearchResults> {
-        // V1 limitation: InnerTube search is not implemented. The
-        // plan calls for a V2 InnerTube client. We log a warning and
-        // return an empty result set so callers degrade gracefully.
-        warn!("YT Music search is not implemented in V1; install ytmusicapi or wait for V2");
-        Ok(SearchResults::default())
+        let mut out = SearchResults::default();
+        if query.trim().is_empty() {
+            return Ok(out);
+        }
+        // The Python `ytmusicapi` search returns songs / albums /
+        // artists / playlists / podcasts in a single call. We
+        // approximate that with `yt-dlp --flat-playlist ytsearch<N>`
+        // which only returns flat video entries. We still try to
+        // bucket by what the `ie_key` / `_type` field reports:
+        // * `video` / `url` → Track
+        // * `playlist` → Playlist
+        // * anything else → Track (best effort)
+        let ytdlp = match self.inner.ytdlp.read().clone() {
+            Some(y) => y,
+            None => {
+                warn!("ytmusic: ytdlp is not installed; search returns empty");
+                return Ok(out);
+            }
+        };
+        let cap = limit.clamp(1, 50);
+        let info = match ytdlp.search(query, cap).await {
+            Ok(i) => i,
+            Err(e) => {
+                warn!(error = %e, "ytmusic: search failed");
+                return Err(ProviderError::Unavailable(e.to_string()));
+            }
+        };
+        let entries = info.entries.unwrap_or_default();
+        for e in entries {
+            if out.tracks.len() + out.playlists.len() >= cap as usize {
+                break;
+            }
+            if e.id.is_empty() {
+                continue;
+            }
+            // `yt-dlp --flat-playlist` exposes `_type` / `ie_key` /
+            // `duration` to let callers bucket the result.
+            let kind = e
+                .ie_key
+                .clone()
+                .or_else(|| e.kind.clone())
+                .unwrap_or_default();
+            if kind.contains("playlist") {
+                let p = playlist_from_info(&e, &self.instance_id, &self.domain);
+                if let Some(p) = p {
+                    out.playlists.push(p);
+                }
+                continue;
+            }
+            // Default: treat as a track.
+            if !media_types.is_empty() && !media_types.contains(&MediaType::Track) {
+                continue;
+            }
+            let t = track_from_video(&e, &self.instance_id, &self.domain);
+            if let Some(t) = t {
+                out.tracks.push(t);
+            }
+        }
+        Ok(out)
     }
 
     async fn get_item(&self, item_id: &str, media_type: MediaType) -> Result<MediaItem> {
@@ -221,27 +275,14 @@ impl MusicProvider for YTMusicProviderImpl {
     ) -> Result<StreamDetails> {
         let ytdlp = self.inner.require_ytdlp()?;
         let url = url_from_id(item_id);
-        // `extract_info` is the slow path but gives us the best
-        // format selection. We use the audio-only format picked by
-        // the parser to fill `content_type`, then `extract_url` to
-        // resolve the direct media URL.
-        let info = ytdlp
-            .extract_info(&url)
+        // Single `yt-dlp` call that returns the best audio format
+        // URL directly. We previously ran `extract_info` + `extract_url`
+        // (two processes); this is one.
+        let best = ytdlp
+            .extract_best_audio(&url)
             .await
             .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
-        let direct_url = ytdlp
-            .extract_url(&url)
-            .await
-            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
-        let formats = info.formats.as_deref().unwrap_or(&[]);
-        let chosen = best_audio_format(formats);
-        let (content_type, bit_rate) = match chosen {
-            Some(f) => (
-                mime_for_format(&f.format_id, &f.ext),
-                f.abr.map(|x| x as u32),
-            ),
-            None => (ContentType::Unknown, None),
-        };
+        let content_type = mime_for_format(&best.format_id, &best.ext);
         debug!(item_id, "ytmusic stream resolved");
         Ok(StreamDetails {
             provider: self.domain.clone(),
@@ -250,18 +291,26 @@ impl MusicProvider for YTMusicProviderImpl {
             stream_type: StreamType::Http,
             audio_format: Some(StreamAudioFormat {
                 content_type,
-                sample_rate: chosen.and_then(|f| f.asr).unwrap_or(0),
+                sample_rate: best.sample_rate.unwrap_or(0),
                 bit_depth: 0,
                 channels: 2,
-                bit_rate,
+                bit_rate: best.bit_rate,
             }),
-            path: direct_url,
+            path: best.direct_url,
             parts: Vec::new(),
-            duration: info.duration,
+            duration: best.duration,
             can_seek: true,
             live: false,
-            title: Some(info.title.clone()),
-            artist: Some(info.uploader.clone()),
+            title: if best.title.is_empty() {
+                None
+            } else {
+                Some(best.title.clone())
+            },
+            artist: if best.uploader.is_empty() {
+                None
+            } else {
+                Some(best.uploader.clone())
+            },
             album: None,
         })
     }
@@ -307,6 +356,40 @@ mod tests {
         assert_eq!(mime_for_format("xyz-mp3-128", "bin"), ContentType::Mp3);
     }
 
+    #[test]
+    fn search_buckets_by_ie_key() {
+        // Direct unit test of the bucketing: build a `VideoInfo`
+        // with two `entries` — one video, one playlist — and feed
+        // them through `track_from_video` / `playlist_from_info`.
+        use crate::yt_dlp::VideoInfo;
+
+        let video = VideoInfo {
+            id: "vid1".into(),
+            title: "Song".into(),
+            uploader: "U".into(),
+            uploader_id: "UCu".into(),
+            duration: Some(100.0),
+            ie_key: Some("Youtube".into()),
+            kind: Some("video".into()),
+            webpage_url: "https://music.youtube.com/watch?v=vid1".into(),
+            ..Default::default()
+        };
+        let playlist = VideoInfo {
+            id: "PLabc".into(),
+            title: "Mix".into(),
+            uploader: "U".into(),
+            entries: Some(vec![]),
+            ie_key: Some("YoutubeTab".into()),
+            kind: Some("playlist".into()),
+            webpage_url: "https://music.youtube.com/playlist?list=PLabc".into(),
+            ..Default::default()
+        };
+        let t = track_from_video(&video, "ytmusic", "ytmusic").unwrap();
+        assert_eq!(t.name, "Song");
+        let p = playlist_from_info(&playlist, "ytmusic", "ytmusic").unwrap();
+        assert_eq!(p.name, "Mix");
+    }
+
     #[tokio::test]
     async fn search_returns_empty() {
         // We need a handle; the provider is best tested via the
@@ -323,9 +406,11 @@ mod tests {
             ),
         );
         let handle = p.into_handle("ytmusic".into());
+        // Empty query short-circuits before the (missing) binary is
+        // invoked, so we don't need yt-dlp on PATH for this test.
         let results = handle
             .music
-            .search("test", &[MediaType::Track], 10)
+            .search("", &[MediaType::Track], 10)
             .await
             .unwrap();
         assert!(results.tracks.is_empty());
@@ -357,7 +442,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let chosen = best_audio_format(info.formats.as_deref().unwrap()).unwrap();
+        let chosen = crate::parser::best_audio_format(info.formats.as_deref().unwrap()).unwrap();
         let details = StreamDetails {
             provider: "ytmusic".into(),
             item_id: ma_core::identifiers::MediaItemId("id1".into()),

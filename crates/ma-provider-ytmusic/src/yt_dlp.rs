@@ -67,6 +67,12 @@ pub struct VideoInfo {
     pub playlist_count: Option<u32>,
     pub entries: Option<Vec<VideoInfo>>,
     pub formats: Option<Vec<FormatInfo>>,
+    /// `yt-dlp` extractor key (e.g. `"Youtube"`, `"YoutubeTab"`). Used
+    /// by `search()` to bucket hits into tracks / playlists.
+    #[serde(rename = "ie_key")]
+    pub ie_key: Option<String>,
+    /// `yt-dlp` per-entry kind (`"video"`, `"playlist"`, `"url"`, …).
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -189,7 +195,37 @@ impl Ytdlp {
         cmd.arg("--no-warnings")
             .arg("--no-progress")
             .arg("--no-color")
-            .arg("--no-playlist"); // default off; callers re-enable per call
+            .arg("--no-playlist");
+        if let Some(ref cookies) = self.opts.cookie_file {
+            cmd.arg("--cookies").arg(cookies);
+        }
+        if self.opts.po_token.is_some() || self.opts.player_client.is_some() {
+            let mut parts = Vec::new();
+            if let Some(ref t) = self.opts.po_token {
+                parts.push(format!("po_token=web.player+{t}"));
+            }
+            if let Some(ref v) = self.opts.visitor_data {
+                parts.push(format!("visitor_data={v}"));
+            }
+            if let Some(ref c) = self.opts.player_client {
+                parts.push(format!("player_client={c}"));
+            }
+            cmd.arg("--extractor-args")
+                .arg(format!("youtube:{}", parts.join(";")));
+        }
+        cmd
+    }
+
+    /// Build a command that allows playlists/searches to return
+    /// `entries`. Used by `search()` and the multi-track case in
+    /// `extract_info` when the URL resolves to a playlist.
+    fn build_command_multi(&self) -> Command {
+        let mut cmd = Command::new(&self.binary);
+        cmd.arg("--no-warnings")
+            .arg("--no-progress")
+            .arg("--no-color");
+        // No `--no-playlist` here: playlist / search responses come
+        // through as `entries` and we want them.
         if let Some(ref cookies) = self.opts.cookie_file {
             cmd.arg("--cookies").arg(cookies);
         }
@@ -230,6 +266,7 @@ impl Ytdlp {
 
     /// Run `yt-dlp -g <url>` and return the resolved direct media URL
     /// (the first non-empty line of stdout).
+    #[allow(dead_code)]
     pub async fn extract_url(&self, url: &str) -> Result<String> {
         if self.opts.cookie_file.is_none() {
             return Err(YtdlpError::NoCookie);
@@ -253,6 +290,87 @@ impl Ytdlp {
         }
         Ok(trimmed)
     }
+
+    /// Run `yt-dlp -J --flat-playlist "ytsearch<N>:<query>"` and
+    /// return the resulting JSON. The top-level `entries` (when
+    /// present) contains the search hits as flat `VideoInfo`s.
+    ///
+    /// We use the `--flat-playlist` form for speed: each entry only
+    /// carries the metadata `yt-dlp` returns without a full
+    /// per-video metadata fetch. The provider then calls
+    /// `extract_info` on the picked `id` to resolve the actual
+    /// stream.
+    pub async fn search(&self, query: &str, limit: u32) -> Result<VideoInfo> {
+        if query.trim().is_empty() {
+            return Err(YtdlpError::NoUrl("empty query".to_string()));
+        }
+        let limit = limit.clamp(1, 50);
+        let url = format!("ytsearch{limit}:{query}");
+        let mut cmd = self.build_command_multi();
+        cmd.arg("-J").arg("--flat-playlist").arg(&url);
+        let output = run_with_timeout(cmd, self.opts.timeout).await?;
+        if !output.status.success() {
+            return Err(YtdlpError::NonZeroExit(
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        let info: VideoInfo = serde_json::from_slice(&output.stdout)?;
+        Ok(info)
+    }
+
+    /// Run `yt-dlp -J -f bestaudio/best --no-playlist` and pick the
+    /// direct media URL from the first non-empty format URL. This is
+    /// a single-call equivalent of `extract_info` + `extract_url`
+    /// that we use from `get_stream_details`.
+    pub async fn extract_best_audio(&self, url: &str) -> Result<BestAudioResult> {
+        if self.opts.cookie_file.is_none() {
+            return Err(YtdlpError::NoCookie);
+        }
+        let mut cmd = self.build_command();
+        cmd.arg("-J").arg("-f").arg("bestaudio/best").arg(url);
+        let output = run_with_timeout(cmd, self.opts.timeout).await?;
+        if !output.status.success() {
+            return Err(YtdlpError::NonZeroExit(
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        let info: VideoInfo = serde_json::from_slice(&output.stdout)?;
+        let chosen = info
+            .formats
+            .as_deref()
+            .and_then(best_audio_format_field)
+            .ok_or_else(|| YtdlpError::NoUrl(url.to_string()))?;
+        Ok(BestAudioResult {
+            direct_url: chosen.url.clone(),
+            ext: chosen.ext.clone(),
+            format_id: chosen.format_id.clone(),
+            duration: info.duration,
+            title: info.title.clone(),
+            uploader: info.uploader.clone(),
+            sample_rate: chosen.asr,
+            bit_rate: chosen.abr.map(|x| x as u32),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BestAudioResult {
+    pub direct_url: String,
+    pub ext: String,
+    pub format_id: String,
+    pub duration: Option<f64>,
+    pub title: String,
+    pub uploader: String,
+    pub sample_rate: Option<u32>,
+    pub bit_rate: Option<u32>,
+}
+
+/// Pick the best audio-only format. Re-exported from
+/// [`crate::parser::best_audio_format`].
+pub(crate) fn best_audio_format_field(formats: &[FormatInfo]) -> Option<&FormatInfo> {
+    crate::parser::best_audio_format(formats)
 }
 
 #[derive(Default)]
@@ -361,5 +479,79 @@ mod tests {
         assert!(value.contains("po_token=web.player+abc"));
         assert!(value.contains("visitor_data=vd"));
         assert!(value.contains("player_client=web"));
+    }
+
+    #[test]
+    fn deserializes_search_response_with_entries() {
+        // Typical `yt-dlp -J --flat-playlist "ytsearch5:Nirvana"` output.
+        let raw = serde_json::json!({
+            "_type": "playlist",
+            "id": "ytsearch5:Nirvana",
+            "title": "ytsearch5:Nirvana",
+            "entries": [
+                {
+                    "id": "dQw4w9WgXcQ",
+                    "title": "Never Gonna Give You Up",
+                    "uploader": "Rick Astley",
+                    "uploader_id": "UCuAXFkgsw1L7xaCfnd5JJOw",
+                    "duration": 213.0,
+                    "ie_key": "Youtube",
+                    "kind": "video",
+                    "thumbnails": [{"url": "https://x/120.jpg", "width": 120, "height": 90}]
+                },
+                {
+                    "id": "PLabc",
+                    "title": "Nirvana Greatest Hits",
+                    "uploader": "Nirvana",
+                    "ie_key": "YoutubeTab",
+                    "kind": "playlist",
+                    "thumbnails": []
+                }
+            ]
+        });
+        let info: VideoInfo = serde_json::from_value(raw).unwrap();
+        let entries = info.entries.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].ie_key.as_deref(), Some("Youtube"));
+        assert_eq!(entries[0].kind.as_deref(), Some("video"));
+        assert_eq!(entries[1].ie_key.as_deref(), Some("YoutubeTab"));
+        assert_eq!(entries[1].kind.as_deref(), Some("playlist"));
+    }
+
+    #[test]
+    fn best_audio_format_field_picks_highest_abr() {
+        let formats = vec![
+            FormatInfo {
+                format_id: "video".into(),
+                ext: "mp4".into(),
+                url: "https://x/video.mp4".into(),
+                acodec: "aac".into(),
+                vcodec: "h264".into(),
+                abr: Some(128.0),
+                ..Default::default()
+            },
+            FormatInfo {
+                format_id: "audio_160".into(),
+                ext: "m4a".into(),
+                url: "https://x/audio_160.m4a".into(),
+                acodec: "aac".into(),
+                vcodec: "none".into(),
+                abr: Some(160.0),
+                asr: Some(48000),
+                ..Default::default()
+            },
+            FormatInfo {
+                format_id: "audio_128".into(),
+                ext: "m4a".into(),
+                url: "https://x/audio_128.m4a".into(),
+                acodec: "aac".into(),
+                vcodec: "none".into(),
+                abr: Some(128.0),
+                asr: Some(44100),
+                ..Default::default()
+            },
+        ];
+        let chosen = best_audio_format_field(&formats).unwrap();
+        assert_eq!(chosen.format_id, "audio_160");
     }
 }

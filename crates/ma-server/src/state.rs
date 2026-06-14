@@ -7,6 +7,7 @@ use ma_config::MassConfig;
 use ma_core::api::CommandRegistry;
 use ma_core::identifiers::PlayerId;
 use ma_core::player::{Player, PlayerControl};
+use ma_ha::HaPlayer;
 use ma_player_bridge::BridgePlayer;
 use ma_player_sync_group::{SyncGroup, SyncGroupConfig};
 use ma_player_universal_group::{UniversalGroup, UniversalGroupConfig};
@@ -58,9 +59,6 @@ impl AppState {
 
 /// Phase 4 player controller. Owns the live sync-group and
 /// universal-group instances, plus a registry of bridge players.
-/// Real players (Sendspin, etc.) register themselves in here too
-/// once Phase 1+ providers attach; for now it's just the synthetic
-/// group / bridge players.
 #[derive(Default)]
 pub struct PlayerController {
     /// Live sync groups keyed by their `player_id`.
@@ -69,6 +67,10 @@ pub struct PlayerController {
     pub universal_groups: parking_lot::RwLock<HashMap<PlayerId, Arc<UniversalGroup>>>,
     /// Live bridge players keyed by their `player_id`.
     pub bridges: parking_lot::RwLock<HashMap<PlayerId, Arc<BridgePlayer>>>,
+    /// Live Home Assistant `media_player.*` imports, keyed by
+    /// `entity_id`. Populated by the HA discovery loop in
+    /// [`crate::lib::run`].
+    pub ha_players: parking_lot::RwLock<HashMap<PlayerId, Arc<HaPlayer>>>,
 }
 
 impl PlayerController {
@@ -107,6 +109,25 @@ impl PlayerController {
         bridge
     }
 
+    /// Insert or replace a Home Assistant `media_player` import. The
+    /// previous handle (if any) is dropped, which means any
+    /// `BridgePlayer` wrapping it must be torn down separately by
+    /// the caller.
+    pub fn register_ha_player(&self, entity_id: &str, player: Arc<HaPlayer>) -> PlayerId {
+        let id = PlayerId::from(entity_id.to_string());
+        self.ha_players.write().insert(id.clone(), player);
+        id
+    }
+
+    /// Remove a HA player from the controller. Returns the dropped
+    /// handle (if any) so the caller can also drop any bridge that
+    /// was wrapping it.
+    pub fn unregister_ha_player(&self, entity_id: &str) -> Option<Arc<HaPlayer>> {
+        self.ha_players
+            .write()
+            .remove(&PlayerId::from(entity_id.to_string()))
+    }
+
     /// Get a snapshot of every registered player (synthetic or
     /// real). Phase 5 will list these via the webserver; for now
     /// we expose the method for tests.
@@ -120,6 +141,9 @@ impl PlayerController {
         }
         for b in self.bridges.read().values() {
             out.push(b.snapshot());
+        }
+        for p in self.ha_players.read().values() {
+            out.push(p.state());
         }
         out
     }
@@ -162,6 +186,26 @@ mod tests {
         assert_eq!(players.len(), 1);
         assert_eq!(players[0].type_, PlayerType::Group);
         assert_eq!(players[0].provider, "syncgroup");
+    }
+
+    #[test]
+    fn ha_players_register_and_unregister() {
+        let ctrl = PlayerController::new();
+        let client = Arc::new(ma_ha::HaClient::new("http://ha.local:8123", "tok", true).unwrap());
+        let p = ma_ha::HaPlayer::new("media_player.living".into(), "Living".into(), client);
+        let id = ctrl.register_ha_player("media_player.living", p.clone());
+        assert_eq!(id.to_string(), "media_player.living");
+        assert_eq!(ctrl.ha_players.read().len(), 1);
+        assert_eq!(ctrl.all_players().len(), 1);
+        let dropped = ctrl.unregister_ha_player("media_player.living");
+        assert!(dropped.is_some());
+        assert!(ctrl.ha_players.read().is_empty());
+    }
+
+    #[test]
+    fn unregister_unknown_returns_none() {
+        let ctrl = PlayerController::new();
+        assert!(ctrl.unregister_ha_player("media_player.missing").is_none());
     }
 
     #[test]

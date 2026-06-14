@@ -15,6 +15,9 @@ use tracing::{debug, warn};
 use crate::client::{HaClient, HaClientError, HaEntity};
 use crate::config::HaConfig;
 
+/// Convenience alias for the receiver end of the discovery channel.
+pub type DiscoverRx = Receiver<Vec<DiscoveredEntity>>;
+
 #[derive(Debug, Error)]
 pub enum DiscoverError {
     #[error("client error: {0}")]

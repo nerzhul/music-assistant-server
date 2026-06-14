@@ -35,7 +35,8 @@ pub mod discover;
 pub mod manifest;
 pub mod player;
 
-pub use client::{HaClient, HaClientError};
+pub use client::{HaClient, HaClientError, HaEntity};
 pub use config::{HaAuthMode, HaConfig};
-pub use discover::{Discover, DiscoverError, DiscoveredEntity};
+pub use discover::{Discover, DiscoverError, DiscoverRx, DiscoveredEntity};
 pub use manifest::hass_manifest;
+pub use player::{HaPlayer, HaPlayerSnapshot};
