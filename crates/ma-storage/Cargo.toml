@@ -1,0 +1,27 @@
+[package]
+name = "ma-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Database layer (SQLite + PostgreSQL) for Music Assistant: schema, migrations, repositories."
+
+[dependencies]
+ma-core = { path = "../ma-core" }
+
+async-trait = { workspace = true }
+sqlx = { workspace = true, features = ["any", "sqlite", "postgres", "macros", "migrate"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"

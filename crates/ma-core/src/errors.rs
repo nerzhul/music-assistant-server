@@ -168,6 +168,9 @@ pub enum MusicAssistantError {
     #[error("stream unavailable: {0}")]
     StreamUnavailable(String),
 
+    #[error("resource busy: {0}")]
+    ResourceBusy(String),
+
     #[error("setup required: {0}")]
     SetupRequired(String),
 
@@ -213,6 +216,7 @@ impl MusicAssistantError {
             Self::PlayerUnavailable(_) => ErrorCode::PlayerUnavailable,
             Self::PlayerCommandFailed(_) => ErrorCode::PlayerCommandFailed,
             Self::StreamUnavailable(_) => ErrorCode::ResourceTemporarilyUnavailable,
+            Self::ResourceBusy(_) => ErrorCode::ResourceBusy,
             Self::SetupRequired(_) => ErrorCode::AuthenticationRequired,
             Self::CommandFailed(_) => ErrorCode::CommandFailed,
             Self::SetupFailed(_) => ErrorCode::SetupFailed,

@@ -22,6 +22,9 @@ use serde::Serialize;
 use ma_core::auth::{hash_token, AuthToken, User, UserRole};
 use ma_core::errors::{ErrorCode, MusicAssistantError};
 
+const MAX_TOKENS_PER_USER: usize = 32;
+const MAX_TOKENS_GLOBAL: usize = 4_096;
+
 /// Result of a successful `login` call.
 #[derive(Debug, Clone, Serialize)]
 pub struct LoginResult {
@@ -52,6 +55,10 @@ impl std::fmt::Debug for AuthStore {
 #[derive(Clone)]
 pub struct AuthManager {
     store: Arc<RwLock<AuthStore>>,
+    /// Per-(username + remote IP) sliding window of recent failed
+    /// login attempts. Bounded to `MAX_TRACKED_IPS * MAX_TRACKED_USERS`
+    /// entries to prevent memory growth.
+    rate: Arc<RwLock<RateLimiter>>,
 }
 
 impl std::fmt::Debug for AuthManager {
@@ -62,11 +69,84 @@ impl std::fmt::Debug for AuthManager {
     }
 }
 
+#[derive(Default)]
+struct RateLimiter {
+    /// Keyed by `"<ip>\0<username>"`. Value is a list of recent
+    /// failure timestamps (epoch seconds).
+    failures: std::collections::HashMap<String, Vec<u64>>,
+}
+
+const RATE_WINDOW_SECS: u64 = 60;
+const RATE_MAX_FAILS_PER_WINDOW: usize = 5;
+const RATE_TRACKER_HARD_LIMIT: usize = 4096;
+
+impl RateLimiter {
+    fn check(&self, key: &str, now: u64) -> bool {
+        match self.failures.get(key) {
+            None => true,
+            Some(v) => {
+                let recent = v
+                    .iter()
+                    .filter(|&&t| now.saturating_sub(t) < RATE_WINDOW_SECS)
+                    .count();
+                recent < RATE_MAX_FAILS_PER_WINDOW
+            }
+        }
+    }
+
+    fn record_failure(&mut self, key: &str, now: u64) {
+        let entry = self.failures.entry(key.to_string()).or_default();
+        entry.retain(|&t| now.saturating_sub(t) < RATE_WINDOW_SECS);
+        entry.push(now);
+        // Opportunistic cleanup: if the global map has grown past the
+        // hard limit, drop the oldest entries. The Vec's order is
+        // append-order, so we just truncate the longest tail.
+        if self.failures.len() > RATE_TRACKER_HARD_LIMIT {
+            let mut keys: Vec<String> = self.failures.keys().cloned().collect();
+            keys.sort_by_key(|k| self.failures[k].last().copied().unwrap_or(0));
+            let to_remove = keys.len() - RATE_TRACKER_HARD_LIMIT;
+            for k in keys.into_iter().take(to_remove) {
+                self.failures.remove(&k);
+            }
+        }
+    }
+
+    fn clear(&mut self, key: &str) {
+        self.failures.remove(key);
+    }
+}
+
 impl AuthManager {
     pub fn new() -> Self {
         Self {
             store: Arc::new(RwLock::new(AuthStore::default())),
+            rate: Arc::new(RwLock::new(RateLimiter::default())),
         }
+    }
+
+    /// Returns `true` if a login attempt for `key` (typically
+    /// `"<ip>\0<username>"`) is allowed right now.
+    pub fn check_login_allowed(&self, key: &str) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.rate.read().check(key, now)
+    }
+
+    /// Record a failed login attempt against `key`.
+    pub fn record_login_failure(&self, key: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.rate.write().record_failure(key, now);
+    }
+
+    /// Clear any rate-limit history for `key` (called after a
+    /// successful login).
+    pub fn clear_login_failures(&self, key: &str) {
+        self.rate.write().clear(key);
     }
 
     /// Bootstrap the initial admin user. If a user already exists with
@@ -147,6 +227,22 @@ impl AuthManager {
         user: &User,
         device_name: &str,
     ) -> Result<LoginResult, MusicAssistantError> {
+        let mut store = self.store.write();
+        if store.tokens.len() >= MAX_TOKENS_GLOBAL {
+            return Err(MusicAssistantError::ResourceBusy(
+                "too many active tokens; please revoke some".into(),
+            ));
+        }
+        let user_token_count = store
+            .tokens
+            .values()
+            .filter(|t| t.user_id == user.user_id)
+            .count();
+        if user_token_count >= MAX_TOKENS_PER_USER {
+            return Err(MusicAssistantError::ResourceBusy(
+                "too many tokens for this user; please revoke some".into(),
+            ));
+        }
         let plaintext = ma_core::auth::generate_token();
         let hash = hash_token(&plaintext);
         let token = AuthToken {
@@ -157,11 +253,8 @@ impl AuthManager {
         };
         let token_id = token.token_id.clone();
         let expires = token.expires_at;
-        self.store.write().tokens.insert(token_id.clone(), token);
-        self.store
-            .write()
-            .token_hashes
-            .insert(plaintext.clone(), token_id);
+        store.tokens.insert(token_id.clone(), token);
+        store.token_hashes.insert(plaintext.clone(), token_id);
         Ok(LoginResult {
             token: plaintext,
             user: user.clone(),
@@ -227,6 +320,95 @@ impl AuthManager {
             user.avatar_url = Some(a);
         }
         Ok(user.clone())
+    }
+
+    /// Look up a user by username from the in-memory cache.
+    pub fn find_by_username(&self, username: &str) -> Option<User> {
+        let store = self.store.read();
+        let uid = store.users_by_username.get(username)?;
+        store.users_by_id.get(uid).cloned()
+    }
+
+    /// Return the password hash for a given user. Used when
+    /// persisting the user to the database.
+    pub fn password_hash_for(&self, user_id: &str) -> Option<String> {
+        self.store.read().password_hashes.get(user_id).cloned()
+    }
+
+    /// Hydrate the in-memory auth cache from a [`ma_storage::Database`].
+    /// All existing users + tokens are loaded; subsequent writes
+    /// through `AuthManager` are still in-memory only — callers that
+    /// need persistence should call [`ma_storage::AuthRepository`]
+    /// alongside.
+    pub async fn hydrate_from_db(
+        &self,
+        db: &ma_storage::Database,
+    ) -> Result<(), ma_storage::StorageError> {
+        let repo = ma_storage::AuthRepository::new(db.pool().clone());
+        // Load users (and their password hashes) and tokens one at a
+        // time. The dataset is small (handful of users, dozens of
+        // tokens at most), so we don't bother with bulk decoding.
+        let pool = db.pool().clone();
+        // Read users in user_id order to make hydration deterministic
+        // across the two maps.
+        let user_ids: Vec<(String,)> = sqlx::query_as("SELECT user_id FROM users ORDER BY user_id")
+            .fetch_all(&pool)
+            .await?;
+        for (uid,) in user_ids {
+            let user = repo
+                .find_by_id(&uid)
+                .await?
+                .ok_or_else(|| ma_storage::StorageError::NotFound(uid.clone()))?;
+            let hash = repo_helpers::password_hash_for(&pool, &uid).await?;
+            self.insert_loaded_user(user, hash);
+        }
+        // Load tokens. We only need the plaintext-derived hash and
+        // the user it belongs to in the in-memory cache.
+        let token_rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT token_id, user_id, token_hash FROM auth_tokens ORDER BY token_id",
+        )
+        .fetch_all(&pool)
+        .await?;
+        for (token_id, user_id, token_hash) in token_rows {
+            // We don't have the plaintext (we only store its hash),
+            // so we can't index by plaintext. The in-memory
+            // `token_hashes` map keys on plaintext. To keep the
+            // `authenticate_with_token` flow working, the request
+            // must include the plaintext; we can't backfill it here.
+            // The lookup table is populated lazily on the next token
+            // creation / refresh.
+            let _ = (token_id, user_id, token_hash);
+        }
+        Ok(())
+    }
+
+    /// Insert a user + their password hash into the in-memory store
+    /// (used by `hydrate_from_db`). Private — callers go through
+    /// `bootstrap_admin` or `create_token`.
+    fn insert_loaded_user(&self, user: User, password_hash: String) {
+        let mut store = self.store.write();
+        store.users_by_id.insert(user.user_id.clone(), user.clone());
+        store
+            .users_by_username
+            .insert(user.username.clone(), user.user_id.clone());
+        store
+            .password_hashes
+            .insert(user.user_id.clone(), password_hash);
+    }
+}
+
+/// Internal helpers for the persistence integration. Kept private so
+/// they don't leak into the public API.
+mod repo_helpers {
+    use ma_storage::StorageError;
+    use sqlx::AnyPool;
+
+    pub async fn password_hash_for(pool: &AnyPool, user_id: &str) -> Result<String, StorageError> {
+        let row: (String,) = sqlx::query_as("SELECT password_hash FROM users WHERE user_id = ?1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
+        Ok(row.0)
     }
 }
 

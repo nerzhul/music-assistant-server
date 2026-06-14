@@ -103,8 +103,15 @@ impl S3Config {
 #[derive(Debug, Default, Clone)]
 pub struct S3ScanResult {
     /// Absolute S3 keys for every audio file under `library_prefix`.
+    /// Capped at [`S3_SCAN_MAX_KEYS`] entries to keep memory bounded
+    /// for buckets with millions of objects.
     pub tracks: Vec<String>,
 }
+
+/// Hard cap on the number of tracks kept in the S3 scan result.
+/// At ~80 bytes per key, 200k entries is ~16 MiB which is a sensible
+/// upper bound for a home music library.
+pub const S3_SCAN_MAX_KEYS: usize = 200_000;
 
 pub struct S3Provider {
     pub config: S3Config,
@@ -113,6 +120,12 @@ pub struct S3Provider {
     parsed_cache: RwLock<std::collections::HashMap<String, Arc<ParsedTrack>>>,
     http: Client,
 }
+
+/// Maximum number of `ParsedTrack` entries held in the S3 tag cache.
+/// Each entry is typically a few KiB (an `Arc<ParsedTrack>` plus the
+/// embedded `Track` and optional `Album`); a 4096-entry cap keeps
+/// the cache well under 50 MiB even in the worst case.
+pub const S3_TAG_CACHE_MAX_ENTRIES: usize = 4_096;
 
 impl std::fmt::Debug for S3Provider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -162,14 +175,23 @@ impl S3Provider {
             return Ok(cached);
         }
         let prefix_full = self.full_library_prefix();
-        let mut tracks = Vec::new();
+        let mut tracks: Vec<String> = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
+            if tracks.len() >= S3_SCAN_MAX_KEYS {
+                // We've hit the cap; record it once so the operator
+                // can re-shard the bucket if needed.
+                tracing::warn!(
+                    cap = S3_SCAN_MAX_KEYS,
+                    "s3 scan truncated; consider sharding the library across multiple prefixes"
+                );
+                break;
+            }
             let page = self
                 .list_page(&prefix_full, continuation.as_deref())
                 .await?;
             for key in page.keys {
-                if is_audio_key(&key) {
+                if is_audio_key(&key) && tracks.len() < S3_SCAN_MAX_KEYS {
                     tracks.push(key);
                 }
             }
@@ -277,9 +299,22 @@ impl S3Provider {
             .ok()
             .flatten()?;
         let arc = Arc::new(parsed);
-        self.parsed_cache
-            .write()
-            .insert(key.to_string(), Arc::clone(&arc));
+        let mut cache = self.parsed_cache.write();
+        // Bound the cache: when the cap is hit, drop a random quarter
+        // of the entries. Random eviction is good enough for a
+        // tag-cache: hits aren't a hard requirement, and avoiding a
+        // full LRU keeps the code path O(1).
+        if cache.len() >= S3_TAG_CACHE_MAX_ENTRIES {
+            let drop_keys: Vec<String> = cache
+                .keys()
+                .take(S3_TAG_CACHE_MAX_ENTRIES / 4)
+                .cloned()
+                .collect();
+            for k in drop_keys {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(key.to_string(), Arc::clone(&arc));
         Some(arc)
     }
 }
@@ -295,7 +330,12 @@ fn parse_list_objects(xml: &str, prefix: &str) -> ListPage {
     use quick_xml::reader::Reader;
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+    // Reuse a single buffer for the outer loop and another one for
+    // the nested text reads so we don't allocate per element. The XML
+    // response can be tens of MB for a busy bucket, so saving the
+    // per-element alloc is non-trivial.
+    let mut buf = Vec::with_capacity(4 * 1024);
+    let mut text_buf = Vec::with_capacity(256);
     let mut page = ListPage::default();
     let mut current_key: Option<String> = None;
     let mut current_token: Option<String> = None;
@@ -303,7 +343,8 @@ fn parse_list_objects(xml: &str, prefix: &str) -> ListPage {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match e.name().as_ref() {
                 b"Key" => {
-                    if let Ok(Event::Text(t)) = reader.read_event_into(&mut Vec::new()) {
+                    text_buf.clear();
+                    if let Ok(Event::Text(t)) = reader.read_event_into(&mut text_buf) {
                         current_key = Some(
                             t.unescape()
                                 .ok()
@@ -313,7 +354,8 @@ fn parse_list_objects(xml: &str, prefix: &str) -> ListPage {
                     }
                 }
                 b"NextContinuationToken" => {
-                    if let Ok(Event::Text(t)) = reader.read_event_into(&mut Vec::new()) {
+                    text_buf.clear();
+                    if let Ok(Event::Text(t)) = reader.read_event_into(&mut text_buf) {
                         current_token = Some(
                             t.unescape()
                                 .ok()

@@ -20,6 +20,9 @@
 //! * `GET    /imageproxy?...`    — cover art proxy (404 until Phase 6)
 //! * `GET    /preview`           — track preview stream (501 until Phase 6)
 
+#![forbid(unsafe_code)]
+#![warn(rust_2018_idioms)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -98,6 +101,12 @@ async fn get_root() -> &'static str {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
+    // SECURITY: `CorsLayer::very_permissive()` is the safest default
+    // for a LAN-only deployment (the MA UI is typically served from
+    // the same origin as the API). For internet-facing deployments
+    // the operator MUST front the server with a reverse proxy that
+    // enforces an allowlist of origins; the server is not designed
+    // to be exposed directly.
     Router::new()
         .route("/", get(get_root))
         .route("/health", get(get_health))
@@ -113,9 +122,33 @@ pub async fn run(config: MassConfig) -> anyhow::Result<()> {
     let player_controller = Arc::new(PlayerController::new());
     let auth = crate::auth::AuthManager::new();
     let registry = ma_providers::provider::ProviderRegistry::new();
-    register_builtin_providers(&registry, &config);
+    register_builtin_providers(&registry, &config).await;
     info!(providers = registry.list().len(), "providers registered");
     let registry_arc = registry;
+
+    // Open the database (SQLite by default, PostgreSQL when
+    // MA_DATABASE_URL points at a postgres:// URL). The connection
+    // pool + migrations are managed by `ma_storage`. When the
+    // database cannot be opened (e.g. in tests, or when the operator
+    // disabled it), the server continues with the in-memory auth
+    // backend only.
+    let database: Option<Arc<ma_storage::Database>> =
+        match ma_storage::pool::DatabaseConfig::from_env() {
+            Ok(cfg) => match ma_storage::Database::connect(cfg).await {
+                Ok(db) => {
+                    info!(kind = db.kind().as_str(), "database ready");
+                    Some(Arc::new(db))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "database connect failed; running without persistence");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "database config invalid; running without persistence");
+                None
+            }
+        };
 
     // Build a placeholder AppState so the commands registry can close
     // over it, then swap in the real one.
@@ -127,27 +160,55 @@ pub async fn run(config: MassConfig) -> anyhow::Result<()> {
         Arc::clone(&registry_arc),
     ));
     let commands = crate::commands::build_registry(placeholder.clone());
-    let state = Arc::new(AppState::new(
+    let mut state = AppState::new(
         config.clone(),
         player_controller.clone(),
         auth.clone(),
         commands,
         registry_arc.clone(),
-    ));
+    );
+    state = state.with_database_opt(database.clone());
+    let state = Arc::new(state);
 
-    // Bootstrap the initial admin user. Either the envvar
-    // `MA_AUTH_INITIAL_PASSWORD` is honoured, or a random password is
-    // generated and printed to the log.
+    // If we have a database, hydrate the in-memory auth state from
+    // it. Otherwise (or on first run with no users), bootstrap an
+    // admin from envvars / random password.
+    if let Some(db) = database.as_ref() {
+        state
+            .auth
+            .hydrate_from_db(db)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    }
     let (admin_user, printed) = state
         .auth
         .bootstrap_admin("admin", std::env::var("MA_AUTH_INITIAL_PASSWORD").ok())
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    if let Some(pw) = printed {
+    if printed.is_some() {
+        // SECURITY: we never log the password itself. The operator
+        // either set MA_AUTH_INITIAL_PASSWORD (and therefore already
+        // knows it) or has to read it back from the bootstrap response
+        // (when this code path is invoked via /setup, not here).
         tracing::warn!(
             username = %admin_user.username,
-            password = %pw,
-            "first admin user created; please change this password"
+            "first admin user created; please change the password if you used the auto-generated bootstrap"
         );
+    }
+    if let Some(db) = database.as_ref() {
+        // Persist the bootstrap admin to the DB so a restart preserves
+        // the credentials.
+        let user = state
+            .auth
+            .find_by_username(&admin_user.username)
+            .ok_or_else(|| anyhow::anyhow!("admin user disappeared after bootstrap"))?;
+        let hash = state
+            .auth
+            .password_hash_for(&user.user_id)
+            .ok_or_else(|| anyhow::anyhow!("admin password hash missing"))?;
+        ma_storage::AuthRepository::new(db.pool().clone())
+            .upsert_user(&user, &hash)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     }
 
     let bind = SocketAddr::new(
@@ -191,7 +252,7 @@ pub async fn run(config: MassConfig) -> anyhow::Result<()> {
 /// always work without external credentials (filesystem, radiobrowser,
 /// cover, spotify if a refresh token is present, s3 if MA_S3_BUCKET is
 /// set).
-fn register_builtin_providers(
+async fn register_builtin_providers(
     registry: &ma_providers::provider::ProviderRegistry,
     _config: &MassConfig,
 ) {
@@ -268,6 +329,104 @@ fn register_builtin_providers(
                 }
             }
             Err(e) => tracing::warn!(error = %e, "s3 init failed"),
+        }
+    }
+
+    // iTunes Podcasts: single-instance, env-toggled by country code.
+    if let Ok(country) = std::env::var("MA_PODCASTS_ITUNES_COUNTRY") {
+        let cfg = ma_provider_podcasts::ITunesPodcastsConfig {
+            country,
+            explicit: std::env::var("MA_PODCASTS_ITUNES_EXPLICIT")
+                .ok()
+                .and_then(|v| v.parse::<bool>().ok())
+                .unwrap_or(true),
+            num_episodes: std::env::var("MA_PODCASTS_ITUNES_TOP_LIMIT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(10),
+        };
+        match ma_provider_podcasts::ITunesPodcastsProvider::new(cfg) {
+            Ok(provider) => {
+                let handle = provider.into_handle();
+                if let Err(e) = registry.register(handle) {
+                    tracing::warn!(error = ?e, "itunes_podcasts register failed");
+                } else {
+                    tracing::info!(domain = "itunes_podcasts", "registered");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "itunes_podcasts init failed"),
+        }
+    }
+
+    // RSS feeds: one per `MA_PODCASTS_FEEDS_<N>_URL` env entry. We
+    // support up to 8 instances to keep the env simple.
+    for n in 0..8 {
+        let key = format!("MA_PODCASTS_FEEDS_{n}_URL");
+        if let Ok(feed_url) = std::env::var(&key) {
+            let name = std::env::var(format!("MA_PODCASTS_FEEDS_{n}_NAME"))
+                .unwrap_or_else(|_| format!("podcast_{n}"));
+            let cfg = ma_provider_podcasts::FeedConfig { feed_url };
+            match ma_provider_podcasts::FeedProvider::new(cfg) {
+                Ok(provider) => {
+                    let handle = provider.clone().into_handle(name.clone());
+                    if let Err(e) = registry.register(handle) {
+                        tracing::warn!(error = ?e, "podcastfeed {} register failed", name);
+                    } else {
+                        tracing::info!(domain = "podcastfeed", instance = name, "registered");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "podcastfeed {n} init failed"),
+            }
+        }
+    }
+
+    // YouTube Music: one instance, env-toggled.
+    if std::env::var("MA_YTMUSIC_ENABLED").is_ok() {
+        let instance = std::env::var("MA_YTMUSIC_INSTANCE").unwrap_or_else(|_| "ytmusic".into());
+        let cfg = ma_provider_ytmusic::YTMusicConfig::default();
+        let provider = ma_provider_ytmusic::YTMusicProvider::new(instance.clone(), cfg.clone());
+        match provider.await {
+            Ok(p) => {
+                let handle = p.into_handle(instance.clone());
+                if let Err(e) = registry.register(handle) {
+                    tracing::warn!(error = ?e, "ytmusic register failed");
+                } else {
+                    tracing::info!(domain = "ytmusic", instance, "registered");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "ytmusic init failed"),
+        }
+    }
+
+    // Home Assistant: discover media_player.* entities and expose
+    // them as MA players. The actual player registration happens
+    // later in `state.ha_players` once the discovery loop returns a
+    // snapshot; we just kick the loop here.
+    let ha_cfg = ma_ha::HaConfig::default();
+    if (ha_cfg.url.is_some() && ha_cfg.token.is_some()) || ha_cfg.supervisor_url.is_some() {
+        match ma_ha::HaClient::from_config(&ha_cfg) {
+            Ok(client) => {
+                let client = Arc::new(client);
+                match ma_ha::Discover::new(&ha_cfg, client.clone()) {
+                    Ok(discover) => {
+                        let discover = Arc::new(discover);
+                        let poll_secs = std::env::var("MA_HA_POLL_SECS")
+                            .ok()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(30);
+                        let _handle = discover
+                            .clone()
+                            .spawn(std::time::Duration::from_secs(poll_secs));
+                        tracing::info!(
+                            url = ha_cfg.url.as_deref().unwrap_or("(supervisor)"),
+                            poll_secs,
+                            "home assistant discovery started"
+                        );
+                    }
+                    Err(e) => tracing::warn!(error = %e, "ha discover init failed"),
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "ha client init failed"),
         }
     }
 }

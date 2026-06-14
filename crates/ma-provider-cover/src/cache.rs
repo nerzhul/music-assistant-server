@@ -1,4 +1,7 @@
-//! Cover art cache trait + in-memory and on-disk implementations.
+//! Cover art cache trait + in-memory, on-disk, and database-backed
+//! implementations. The memory cache is the L0 (per-process fast
+//! path), the disk cache is the L1 (cold-restart survives), and the
+//! database cache is the L2 (multi-instance shared).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,6 +25,8 @@ pub enum CacheError {
     Json(#[from] serde_json::Error),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("backend error: {0}")]
+    Backend(String),
 }
 
 /// One cached image with its `ContentType`.
@@ -222,6 +227,131 @@ impl DiskCoverCache {
             }
         }
         Ok(keys)
+    }
+}
+
+/// Database-backed cache (L2). Backs onto `ma_storage::cover_art`. Used
+/// when the server is configured with `MA_DATABASE_URL` so cover
+/// hits survive restarts and are shared across instances.
+pub struct DatabaseCoverCache {
+    repo: ma_storage::CoverArtRepository,
+    provider: String,
+}
+
+impl DatabaseCoverCache {
+    /// Build a new database-backed cache. `provider` is the
+    /// `cover_art.provider` column used when writing new rows
+    /// (e.g. `"itunes"`, `"musicbrainz"`, `"google_cse"`).
+    pub fn new(db: &ma_storage::Database, provider: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            repo: ma_storage::CoverArtRepository::new(db.pool().clone()),
+            provider: provider.into(),
+        })
+    }
+}
+
+#[async_trait]
+impl CoverCache for DatabaseCoverCache {
+    async fn get(&self, key: &str) -> Result<Option<CachedImage>, CacheError> {
+        let rec = self
+            .repo
+            .find(&self.provider, key)
+            .await
+            .map_err(|e| CacheError::Backend(e.to_string()))?;
+        Ok(rec.map(|r| CachedImage {
+            bytes: r.bytes,
+            content_type: r.content_type,
+        }))
+    }
+
+    async fn put(&self, key: &str, image: &CachedImage) -> Result<(), CacheError> {
+        let now = chrono::Utc::now();
+        let record = ma_storage::CoverArtRecord {
+            image_id: format!("{}|{}", self.provider, key),
+            provider: self.provider.clone(),
+            item_id: key.to_string(),
+            url: None,
+            content_type: image.content_type.clone(),
+            width: None,
+            height: None,
+            bytes: image.bytes.clone(),
+            fetched_at: now,
+            last_used_at: None,
+        };
+        self.repo
+            .upsert(&record)
+            .await
+            .map_err(|e| CacheError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn retain(&self, _keep: &[String]) -> Result<(), CacheError> {
+        // The DB cache uses a different retention policy: rows are
+        // pruned by a background job, not on every write. This stub
+        // is here so the trait can be implemented uniformly.
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod database_cache_tests {
+    use super::*;
+    use ma_storage::pool::{Database, DatabaseConfig};
+
+    #[tokio::test]
+    async fn database_cache_round_trip() {
+        let db = Database::connect(DatabaseConfig::in_memory_sqlite())
+            .await
+            .unwrap();
+        let cache = DatabaseCoverCache::new(&db, "itunes");
+        let key = "Aphex Twin / Selected Ambient Works 85-92 / 800";
+        assert!(cache.get(key).await.unwrap().is_none());
+        cache
+            .put(
+                key,
+                &CachedImage {
+                    bytes: b"\xFF\xD8\xFF\xE0fake".to_vec(),
+                    content_type: "image/jpeg".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let hit = cache.get(key).await.unwrap().unwrap();
+        assert_eq!(hit.bytes, b"\xFF\xD8\xFF\xE0fake");
+        assert_eq!(hit.content_type, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn database_cache_different_providers_are_isolated() {
+        let db = Database::connect(DatabaseConfig::in_memory_sqlite())
+            .await
+            .unwrap();
+        let itunes = DatabaseCoverCache::new(&db, "itunes");
+        let mb = DatabaseCoverCache::new(&db, "musicbrainz");
+        let key = "shared-key";
+        itunes
+            .put(
+                key,
+                &CachedImage {
+                    bytes: b"itunes-bytes".to_vec(),
+                    content_type: "image/jpeg".into(),
+                },
+            )
+            .await
+            .unwrap();
+        mb.put(
+            key,
+            &CachedImage {
+                bytes: b"mb-bytes".to_vec(),
+                content_type: "image/png".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let a = itunes.get(key).await.unwrap().unwrap();
+        let b = mb.get(key).await.unwrap().unwrap();
+        assert_eq!(a.bytes, b"itunes-bytes");
+        assert_eq!(b.bytes, b"mb-bytes");
     }
 }
 

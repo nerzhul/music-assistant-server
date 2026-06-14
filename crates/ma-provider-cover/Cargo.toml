@@ -11,18 +11,22 @@ description = "Cover art provider: Google CSE / iTunes Search / Musicbrainz CAA 
 [dependencies]
 ma-core = { path = "../ma-core" }
 ma-providers = { path = "../ma-providers" }
+ma-storage = { path = "../ma-storage" }
 
+async-trait = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-async-trait = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-url = { workspace = true }
-chrono = { workspace = true }
-tokio = { workspace = true }
-reqwest = { workspace = true }
 sha1_smol = "1"
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+url = { workspace = true }
 parking_lot = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
 image = { workspace = true }
 hex = "0.4"
 once_cell = { workspace = true }
+futures = { workspace = true }

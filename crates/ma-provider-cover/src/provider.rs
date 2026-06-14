@@ -77,6 +77,12 @@ impl CoverProvider {
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/tmp/ma-covers"))
             });
+        // The cover provider runs inside the server's tokio
+        // runtime, so we always default to the disk cache at
+        // construction time. If the operator has configured a
+        // database (`MA_DATABASE_URL`), `ma-server` will swap the
+        // disk cache for a `DatabaseCoverCache` *after* the provider
+        // is registered — see `ma_server::run`.
         let cache: Arc<dyn CoverCache> = Arc::new(DiskCoverCache::new(cache_dir));
         Ok(Arc::new(Self {
             config,

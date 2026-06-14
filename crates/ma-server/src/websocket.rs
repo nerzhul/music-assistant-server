@@ -138,15 +138,16 @@ async fn handle_ws(
     let _ = writer.await;
 }
 
-/// `GET /sendspin` — the Sendspin client WebSocket lives in the same
-/// process, so the proxy simply passes the upgrade through. This is
-/// kept as a separate route so the MA UI can hit `/sendspin` as if it
-/// were the public endpoint, while the audio server is bound to its
-/// own port (`MA_SENDSPIN_INBOUND_PORT`).
+/// `GET /sendspin` — the in-process `SendspinServer` runs on its
+/// own port (default 8927). When a client hits the public webserver
+/// at `/sendspin` we return a 503 with the actual port in the JSON
+/// body, so HA-style ingress proxies can be configured to route the
+/// URL to the right listener.
 pub async fn sendspin_proxy(_ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
-    let _ = state;
+    let inbound_port = state.config.sendspin.inbound_port;
     let body = serde_json::json!({
-        "message": "sendspin client lives on the dedicated WebSocket port (MA_SENDSPIN_INBOUND_PORT, default 8927); /sendspin HTTP route is reserved for HA ingress-style proxies",
+        "message": "sendspin client lives on the dedicated WebSocket port; the public webserver doesn't proxy WebSocket upgrades for security reasons",
+        "inbound_port": inbound_port,
     });
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)

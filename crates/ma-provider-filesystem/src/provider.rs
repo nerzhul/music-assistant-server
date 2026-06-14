@@ -48,9 +48,16 @@ pub struct FilesystemProvider {
     pub config: FilesystemConfig,
     /// Cached track records keyed by their absolute path. The
     /// `parser::parse_track_file` call is expensive (lofty is sync) so
-    /// we memoise the result.
+    /// we memoise the result. Capped at
+    /// [`FILESYSTEM_TAG_CACHE_MAX_ENTRIES`] entries to keep memory
+    /// bounded for very large libraries.
     cache: RwLock<std::collections::HashMap<String, Arc<ParsedTrack>>>,
 }
+
+/// Maximum number of `ParsedTrack` entries held in the filesystem
+/// tag cache. 100k entries × a few KiB each is well under 100 MiB
+/// even in the worst case.
+pub const FILESYSTEM_TAG_CACHE_MAX_ENTRIES: usize = 100_000;
 
 impl FilesystemProvider {
     pub fn new(_instance_id: impl Into<String>, config: FilesystemConfig) -> Arc<Self> {
@@ -77,16 +84,28 @@ impl FilesystemProvider {
         crate::scanner::scan(ScanConfig::new(self.config.path.clone())).await
     }
 
-    /// Resolve a single file's tags, caching the result.
+    /// Resolve a single file's tags, caching the result. When the
+    /// cache is full, a random quarter of the entries are evicted
+    /// (random eviction is fine here: the cache is a soft hint, and
+    /// avoiding a real LRU keeps the code path O(1) under load).
     pub fn parse(&self, abs_path: &str) -> Option<Arc<ParsedTrack>> {
         if let Some(hit) = self.cache.read().get(abs_path).cloned() {
             return Some(hit);
         }
         let parsed = parse_track_file(abs_path, &self.config.path.to_string_lossy())?;
         let arc = Arc::new(parsed);
-        self.cache
-            .write()
-            .insert(abs_path.to_string(), Arc::clone(&arc));
+        let mut cache = self.cache.write();
+        if cache.len() >= FILESYSTEM_TAG_CACHE_MAX_ENTRIES {
+            let drop_keys: Vec<String> = cache
+                .keys()
+                .take(FILESYSTEM_TAG_CACHE_MAX_ENTRIES / 4)
+                .cloned()
+                .collect();
+            for k in drop_keys {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(abs_path.to_string(), Arc::clone(&arc));
         Some(arc)
     }
 }

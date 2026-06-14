@@ -26,7 +26,11 @@ ma-provider-radio = { path = "../ma-provider-radio" }
 ma-provider-spotify = { path = "../ma-provider-spotify" }
 ma-provider-s3 = { path = "../ma-provider-s3" }
 ma-provider-cover = { path = "../ma-provider-cover" }
+ma-provider-podcasts = { path = "../ma-provider-podcasts" }
+ma-provider-ytmusic = { path = "../ma-provider-ytmusic" }
+ma-ha = { path = "../ma-ha" }
 ma-cache-s3 = { path = "../ma-cache-s3" }
+ma-storage = { path = "../ma-storage" }
 
 uuid = { workspace = true }
 anyhow = { workspace = true }
@@ -46,6 +50,7 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+sqlx = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }

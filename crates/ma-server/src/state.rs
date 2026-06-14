@@ -19,6 +19,9 @@ pub struct AppState {
     pub auth: AuthManager,
     pub commands: Arc<CommandRegistry>,
     pub providers: Arc<ma_providers::provider::ProviderRegistry>,
+    /// `None` when the in-memory auth backend is used (tests); `Some`
+    /// when a `ma_storage::Database` is configured.
+    pub database: Option<Arc<ma_storage::Database>>,
 }
 
 impl AppState {
@@ -35,7 +38,21 @@ impl AppState {
             auth,
             commands,
             providers,
+            database: None,
         }
+    }
+
+    pub fn with_database(mut self, db: Arc<ma_storage::Database>) -> Self {
+        self.database = Some(db);
+        self
+    }
+
+    /// Variant that accepts an `Option<Arc<Database>>` so the caller
+    /// can pass through a result that may be `None` (when the DB
+    /// failed to open).
+    pub fn with_database_opt(mut self, db: Option<Arc<ma_storage::Database>>) -> Self {
+        self.database = db;
+        self
     }
 }
 

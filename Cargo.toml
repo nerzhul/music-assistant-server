@@ -20,6 +20,10 @@ members = [
     "crates/ma-player-universal-group",
     "crates/ma-player-bridge",
     "crates/ma-cache-s3",
+    "crates/ma-storage",
+    "crates/ma-provider-podcasts",
+    "crates/ma-provider-ytmusic",
+    "crates/ma-ha",
 ]
 
 [workspace.package]
@@ -74,7 +78,8 @@ parking_lot = "0.12"
 figment = { version = "0.10", features = ["toml", "env"] }
 
 # DB
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "macros", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "macros", "chrono", "uuid", "migrate"] }
+sqlx-any = { version = "0.8" }
 
 # crypto / auth
 argon2 = "0.5"

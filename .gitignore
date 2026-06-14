@@ -28,3 +28,9 @@ docs/superpowers
 .devenv*
 devenv.local.nix
 devenv.local.yaml
+
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+

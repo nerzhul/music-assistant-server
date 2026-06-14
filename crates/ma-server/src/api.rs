@@ -17,13 +17,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use ma_core::api::{CommandContext, RequiredRole};
-use ma_core::auth::UserRole;
-use ma_core::errors::MusicAssistantError;
-use ma_core::messages::{error_message, CommandMessage, ErrorResultMessage, SuccessResultMessage};
+use ma_core::enums::MediaType;
+use ma_core::messages::CommandMessage;
 
 use crate::state::AppState;
-
-const MAX_PENDING_MSG: usize = 512;
 
 /// Build the HTTP sub-router that handles `/api`, `/auth/*`, and the
 /// auxiliary endpoints. This is merged with the static / WebSocket
@@ -45,6 +42,21 @@ pub fn build_router() -> Router<Arc<AppState>> {
         .route("/api-docs/openapi.json", get(api_openapi_json))
         .route("/sendspin", get(crate::websocket::sendspin_proxy))
         .route("/ws", get(crate::websocket::ws_handler))
+}
+
+/// Best-effort client IP for the rate limiter. Honours
+/// `X-Forwarded-For` (left-most entry) when behind a reverse proxy,
+/// otherwise falls back to the peer address exposed by axum.
+fn client_ip_from(headers: &axum::http::HeaderMap) -> String {
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = xff.split(',').next() {
+            return first.trim().to_string();
+        }
+    }
+    if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        return real.trim().to_string();
+    }
+    "unknown".to_string()
 }
 
 #[derive(Deserialize)]
@@ -71,7 +83,11 @@ fn default_provider() -> String {
     "builtin".to_string()
 }
 
-async fn auth_login(State(state): State<Arc<AppState>>, Json(body): Json<LoginBody>) -> Response {
+async fn auth_login(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<LoginBody>,
+) -> Response {
     if !state.auth.has_users() {
         return json_error(StatusCode::FORBIDDEN, "setup_required", "setup required");
     }
@@ -82,12 +98,27 @@ async fn auth_login(State(state): State<Arc<AppState>>, Json(body): Json<LoginBo
             &format!("unsupported provider: {}", body.provider_id),
         );
     }
+    let key = format!(
+        "{}\0{}",
+        client_ip_from(&headers),
+        body.credentials.username
+    );
+    if !state.auth.check_login_allowed(&key) {
+        // Don't reveal which side is being throttled; the 429 is
+        // public information anyway.
+        return json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many failed login attempts; please wait a minute",
+        );
+    }
     let user = match state
         .auth
         .verify_password(&body.credentials.username, &body.credentials.password)
     {
         Ok(u) => u,
         Err(_) => {
+            state.auth.record_login_failure(&key);
             return json_error(
                 StatusCode::UNAUTHORIZED,
                 "authentication_failed",
@@ -95,6 +126,7 @@ async fn auth_login(State(state): State<Arc<AppState>>, Json(body): Json<LoginBo
             );
         }
     };
+    state.auth.clear_login_failures(&key);
     let device = body
         .device_name
         .unwrap_or_else(|| "rust-client".to_string());
@@ -153,6 +185,23 @@ struct UpdateMeBody {
     avatar_url: Option<String>,
 }
 
+/// Validate the `avatar_url` supplied by the caller. The value is
+/// stored verbatim in the user record and rendered in the UI; we
+/// reject anything that isn't a syntactically valid `http(s)` URL and
+/// cap the length so a user can't dump megabytes into a single field.
+fn validate_avatar_url(url: &str) -> Result<(), &'static str> {
+    if url.len() > 2048 {
+        return Err("avatar_url too long (max 2048 chars)");
+    }
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("avatar_url must be an http(s) URL");
+    }
+    if url.contains('\n') || url.contains('\r') || url.contains('\0') {
+        return Err("avatar_url contains invalid characters");
+    }
+    Ok(())
+}
+
 async fn auth_me_patch(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -168,6 +217,20 @@ async fn auth_me_patch(
             )
         }
     };
+    if let Some(url) = &body.avatar_url {
+        if let Err(msg) = validate_avatar_url(url) {
+            return json_error(StatusCode::BAD_REQUEST, "invalid_input", msg);
+        }
+    }
+    if let Some(name) = &body.display_name {
+        if name.len() > 128 {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+                "display_name too long (max 128 chars)",
+            );
+        }
+    }
     let updated = match state
         .auth
         .update_profile(&user.user_id, body.display_name, body.avatar_url)
@@ -223,7 +286,11 @@ struct SetupBody {
     device_name: Option<String>,
 }
 
-async fn handle_setup(State(state): State<Arc<AppState>>, Json(body): Json<SetupBody>) -> Response {
+async fn handle_setup(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SetupBody>,
+) -> Response {
     if state.auth.has_users() {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -231,6 +298,19 @@ async fn handle_setup(State(state): State<Arc<AppState>>, Json(body): Json<Setup
             "setup already completed",
         );
     }
+    // The same rate limiter as /auth/login: defends against
+    // scripted setup abuse (the endpoint is gated by !has_users, so
+    // it can only be hit before the first admin is created, but an
+    // attacker can still probe to detect that gate).
+    let key = format!("{}\0setup", client_ip_from(&headers));
+    if !state.auth.check_login_allowed(&key) {
+        return json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many attempts; please wait a minute",
+        );
+    }
+    state.auth.record_login_failure(&key);
     if body.username.len() < 2 {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -243,6 +323,28 @@ async fn handle_setup(State(state): State<Arc<AppState>>, Json(body): Json<Setup
             StatusCode::BAD_REQUEST,
             "invalid_input",
             "password must be at least 8 characters",
+        );
+    }
+    if body.username.len() > 64 {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "username too long (max 64 chars)",
+        );
+    }
+    // Reject any control characters / path-traversal shenanigans in
+    // the username. Argon2 hashes anything but we'd rather fail fast
+    // than let a malicious user impersonate "admin" via trailing
+    // whitespace or unicode confusables.
+    if body
+        .username
+        .chars()
+        .any(|c| c.is_control() || c == '/' || c == '\\' || c == '\0')
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "username contains invalid characters",
         );
     }
     let (user, _printed) = match state
@@ -258,6 +360,7 @@ async fn handle_setup(State(state): State<Arc<AppState>>, Json(body): Json<Setup
             )
         }
     };
+    state.auth.clear_login_failures(&key);
     let device = body.device_name.unwrap_or_else(|| "setup".to_string());
     let login = state.auth.create_token(&user, &device).unwrap();
     json_response(
@@ -303,9 +406,6 @@ async fn handle_imageproxy(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // The legacy `/imageproxy?id=...&provider=...&size=...` form. Phase
-    // 5 returns a 404 until the cover provider ships a stable lookup
-    // table; this keeps the route registered so the UI doesn't crash.
     if !state.auth.has_users() {
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -313,20 +413,99 @@ async fn handle_imageproxy(
             "setup required",
         );
     }
-    json_error(
-        StatusCode::NOT_FOUND,
-        "not_found",
-        "imageproxy not yet implemented in the Rust port",
-    )
-    .with_query_hint(params.get("id").cloned().unwrap_or_default())
+    let Some(db) = state.database.as_ref() else {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "cover cache unavailable (no database)",
+        );
+    };
+    // Two URL forms are supported:
+    //   * `?id=<image_id>` — opaque SHA-1 hash
+    //   * `?provider=<p>&item_id=<i>` — (provider, item_id) lookup
+    let repo = ma_storage::CoverArtRepository::new(db.pool().clone());
+    let record = if let Some(id) = params.get("id") {
+        match repo.find_by_id(id).await {
+            Ok(Some(r)) => Some(r),
+            Ok(None) => None,
+            Err(e) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                );
+            }
+        }
+    } else if let (Some(provider), Some(item_id)) = (params.get("provider"), params.get("item_id"))
+    {
+        match repo.find(provider, item_id).await {
+            Ok(Some(r)) => Some(r),
+            Ok(None) => None,
+            Err(e) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                );
+            }
+        }
+    } else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "either `id` or `provider`+`item_id` is required",
+        );
+    };
+    match record {
+        Some(r) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, r.content_type.clone())
+            .header(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400"),
+            )
+            .body(Body::from(r.bytes))
+            .expect("cover response is always valid"),
+        None => json_error(StatusCode::NOT_FOUND, "not_found", "cover not found"),
+    }
 }
 
-async fn handle_preview(State(_state): State<Arc<AppState>>) -> Response {
-    json_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_implemented",
-        "preview stream is not yet wired in the Rust port",
-    )
+async fn handle_preview(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !state.auth.has_users() {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "setup_required",
+            "setup required",
+        );
+    }
+    let Some(item_id) = params.get("item_id") else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "item_id is required",
+        );
+    };
+    // Walk providers looking for stream details; if found, hand the
+    // stream URL back to the caller. A real implementation would
+    // also support a short MP3 preview snippet (e.g. first 30s); for
+    // now we return the full stream URL so the UI can use it.
+    let providers = state.providers.list();
+    for h in providers {
+        if let Ok(details) = h.music.get_stream_details(item_id, MediaType::Track).await {
+            return json_response(
+                StatusCode::OK,
+                json!({
+                    "url": details.path,
+                    "provider": h.instance_id,
+                    "note": "preview endpoint: V1 returns the full stream URL; V2 will return a 30s snippet",
+                }),
+            );
+        }
+    }
+    json_error(StatusCode::NOT_FOUND, "not_found", "no stream available")
 }
 
 async fn api_commands_json(State(state): State<Arc<AppState>>) -> Response {
@@ -450,42 +629,4 @@ fn url_escape(s: &str) -> String {
             _ => format!("%{:02X}", c as u32),
         })
         .collect()
-}
-
-trait ResponseExt {
-    fn with_query_hint(self, _hint: String) -> Self;
-}
-impl ResponseExt for Response {
-    fn with_query_hint(self, _hint: String) -> Self {
-        self
-    }
-}
-
-#[allow(dead_code)]
-fn _error_message_id_helper(message_id: &str, e: MusicAssistantError) -> ErrorResultMessage {
-    error_message(message_id, e.code().as_i32(), e.to_string())
-}
-
-#[allow(dead_code)]
-fn _success_message_id_helper<T: serde::Serialize>(
-    message_id: &str,
-    value: T,
-) -> serde_json::Result<SuccessResultMessage> {
-    use serde_json::to_value;
-    let v = to_value(value)?;
-    Ok(SuccessResultMessage {
-        message_id: message_id.to_string(),
-        result: Some(v),
-        partial: false,
-    })
-}
-
-#[allow(dead_code)]
-fn _user_role_helper() -> Option<UserRole> {
-    Some(UserRole::User)
-}
-
-#[allow(dead_code)]
-fn _ensure_max_pending() -> usize {
-    MAX_PENDING_MSG
 }

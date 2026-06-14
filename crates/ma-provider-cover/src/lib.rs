@@ -17,5 +17,5 @@ pub mod manifest;
 pub mod musicbrainz;
 pub mod provider;
 
-pub use cache::{CoverCache, DiskCoverCache, MemoryCoverCache};
+pub use cache::{CoverCache, DatabaseCoverCache, DiskCoverCache, MemoryCoverCache};
 pub use provider::{CoverConfig, CoverProvider};
