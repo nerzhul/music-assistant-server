@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
+pub mod api;
+pub mod auth;
 pub mod enums;
 pub mod errors;
 pub mod identifiers;

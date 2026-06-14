@@ -139,6 +139,109 @@ pub struct ParsedTrack {
     pub bit_rate: Option<u32>,
 }
 
+/// Parse a tag header from a byte slice (the first ~256 KiB of a track).
+/// `object_key` is used as the track's `item_id` and as a seed for the
+/// album / artist name fallbacks. Used by remote / S3 sources that can't
+/// give `lofty` a real file path.
+pub fn parse_track_from_bytes(
+    bytes: &[u8],
+    object_key: &str,
+) -> Result<ParsedTrack, lofty::error::LoftyError> {
+    use std::io::Cursor;
+    let cursor = Cursor::new(bytes.to_vec());
+    let tagged = Probe::new(cursor).read()?;
+    parse_with_tagged(&tagged, object_key)
+}
+
+fn parse_with_tagged(
+    tagged: &lofty::file::TaggedFile,
+    object_key: &str,
+) -> Result<ParsedTrack, lofty::error::LoftyError> {
+    let tag = tagged
+        .primary_tag()
+        .or_else(|| tagged.first_tag())
+        .ok_or_else(|| lofty::error::LoftyError::new(lofty::error::ErrorKind::FakeTag))?;
+    let props = tagged.properties();
+    let title = tag.title().map(|s| s.to_string()).unwrap_or_default();
+    let artist_name = tag.artist().map(|s| s.to_string()).unwrap_or_default();
+    let album_name = tag.album().map(|s| s.to_string()).unwrap_or_default();
+    let album_artist = tag
+        .get_string(&lofty::tag::ItemKey::AlbumArtist)
+        .map(|s| s.to_string());
+    let genre = tag.genre().map(|s| s.to_string());
+    let track_num = tag.track();
+    let disc_num = tag.disk();
+    let year = tag.year();
+    let isrc = tag
+        .get_string(&lofty::tag::ItemKey::Isrc)
+        .map(|s| s.to_string());
+    let duration = props.duration().as_secs_f64();
+    let sample_rate = props.sample_rate().unwrap_or(44_100);
+    let channels = props.channels().unwrap_or(2);
+    let bit_depth: u16 = props.bit_depth().unwrap_or(16).into();
+    let ext = std::path::Path::new(object_key)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let content_type = content_type_for_ext(ext).unwrap_or(ContentType::Unknown);
+    let item_id = format!("s3|{}", object_key);
+    let uri = format!("s3://{}", object_key);
+    let artist = Artist {
+        item_id: ma_core::identifiers::MediaItemId(format!("artist:{artist_name}")),
+        provider: "s3".to_string(),
+        name: artist_name,
+        ..Default::default()
+    };
+    let album_artist_obj = album_artist.map(|name| Artist {
+        item_id: ma_core::identifiers::MediaItemId(format!("artist:{name}")),
+        provider: "s3".to_string(),
+        name,
+        ..Default::default()
+    });
+    let album = if album_name.is_empty() {
+        None
+    } else {
+        Some(Album {
+            item_id: ma_core::identifiers::MediaItemId(format!("album:{album_name}")),
+            provider: "s3".to_string(),
+            name: album_name,
+            year,
+            artists: album_artist_obj.into_iter().collect(),
+            ..Default::default()
+        })
+    };
+    let track = Track {
+        item_id: ma_core::identifiers::MediaItemId(item_id),
+        provider: "s3".to_string(),
+        name: if title.is_empty() {
+            std::path::Path::new(object_key)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(object_key)
+                .to_string()
+        } else {
+            title
+        },
+        duration: if duration > 0.0 { Some(duration) } else { None },
+        artists: vec![artist],
+        album,
+        track_number: track_num,
+        disc_number: disc_num,
+        isrc,
+        image_url: None,
+        uri,
+    };
+    Ok(ParsedTrack {
+        track,
+        content_type,
+        sample_rate,
+        channels,
+        bit_depth,
+        genre,
+        bit_rate: props.audio_bitrate(),
+    })
+}
+
 /// Parse a path like `/music/Artist/Album/01 Track.mp3` into its
 /// components. The first segment is the music root, then a hierarchy
 /// of artist / album / disc / track. Returns the immediate parent

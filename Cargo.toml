@@ -13,7 +13,13 @@ members = [
     "crates/ma-provider-filesystem",
     "crates/ma-provider-radio",
     "crates/ma-provider-spotify",
+    "crates/ma-provider-s3",
     "crates/ma-provider-cover",
+    "crates/ma-streams",
+    "crates/ma-player-sync-group",
+    "crates/ma-player-universal-group",
+    "crates/ma-player-bridge",
+    "crates/ma-cache-s3",
 ]
 
 [workspace.package]

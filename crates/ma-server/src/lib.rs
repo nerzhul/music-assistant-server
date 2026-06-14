@@ -1,17 +1,24 @@
 //! `ma-server` — Music Assistant Rust server binary.
 //!
-//! Phase 0 exposes the minimal HTTP surface the UI needs to confirm it can
-//! talk to the Rust binary:
+//! Phase 5 exposes the full HTTP / WebSocket / auth surface the
+//! existing Music Assistant UI needs to drive the server:
 //!
-//! * `GET  /info`        — `ServerInfoMessage` JSON (the same payload the
-//!   Python server sends on WebSocket connect, used by the frontend for
-//!   capability detection).
-//! * `GET  /logo.png`    — the bundled Music Assistant logo (static).
-//! * `GET  /`            — 200 OK placeholder for health checks.
-//! * `GET  /health`      — same as `/`.
-//!
-//! Full auth, API command dispatch, and WebSocket UI are added in later
-//! phases (see plan section "Compatibilité API HTTP/WS avec l'UI").
+//! * `GET    /info`              — `ServerInfoMessage` JSON
+//! * `GET    /logo.png`          — the bundled Music Assistant logo
+//! * `GET    /`                  — root placeholder
+//! * `GET    /health`            — health check
+//! * `POST   /api`               — JSON-RPC-like command dispatch
+//! * `GET    /ws`                — WebSocket command + event channel
+//! * `GET    /sendspin`          — Sendspin proxy (HTTP 503, see websocket.rs)
+//! * `POST   /auth/login`        — login (returns a long-lived token)
+//! * `POST   /auth/logout`       — revoke a token
+//! * `GET    /auth/me`           — current user
+//! * `PATCH  /auth/me`           — update profile
+//! * `GET    /auth/providers`    — list login providers
+//! * `POST   /setup`             — first-time admin bootstrap
+//! * `GET    /api-docs/*.json`   — auto-generated command / schema docs
+//! * `GET    /imageproxy?...`    — cover art proxy (404 until Phase 6)
+//! * `GET    /preview`           — track preview stream (501 until Phase 6)
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,7 +38,12 @@ use ma_core::messages::ServerInfoMessage;
 
 mod state;
 
-pub use state::AppState;
+pub mod api;
+pub mod auth;
+pub mod commands;
+pub mod websocket;
+
+pub use state::{AppState, PlayerController};
 
 const SCHEMA_VERSION: i32 = 31;
 const MIN_SCHEMA_VERSION: i32 = 28;
@@ -82,7 +94,7 @@ async fn get_health() -> &'static str {
 }
 
 async fn get_root() -> &'static str {
-    "Music Assistant (Rust) - phase 0"
+    "Music Assistant (Rust) - phase 5"
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -91,31 +103,66 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(get_health))
         .route("/info", get(get_info))
         .route("/logo.png", get(get_logo))
+        .merge(crate::api::build_router())
         .layer(CorsLayer::very_permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
 pub async fn run(config: MassConfig) -> anyhow::Result<()> {
-    let state = Arc::new(AppState::new(config.clone()));
+    let player_controller = Arc::new(PlayerController::new());
+    let auth = crate::auth::AuthManager::new();
+    let registry = ma_providers::provider::ProviderRegistry::new();
+    register_builtin_providers(&registry, &config);
+    info!(providers = registry.list().len(), "providers registered");
+    let registry_arc = registry;
+
+    // Build a placeholder AppState so the commands registry can close
+    // over it, then swap in the real one.
+    let placeholder = Arc::new(AppState::new(
+        config.clone(),
+        player_controller.clone(),
+        auth.clone(),
+        Arc::new(ma_core::api::CommandRegistry::new()),
+        Arc::clone(&registry_arc),
+    ));
+    let commands = crate::commands::build_registry(placeholder.clone());
+    let state = Arc::new(AppState::new(
+        config.clone(),
+        player_controller.clone(),
+        auth.clone(),
+        commands,
+        registry_arc.clone(),
+    ));
+
+    // Bootstrap the initial admin user. Either the envvar
+    // `MA_AUTH_INITIAL_PASSWORD` is honoured, or a random password is
+    // generated and printed to the log.
+    let (admin_user, printed) = state
+        .auth
+        .bootstrap_admin("admin", std::env::var("MA_AUTH_INITIAL_PASSWORD").ok())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if let Some(pw) = printed {
+        tracing::warn!(
+            username = %admin_user.username,
+            password = %pw,
+            "first admin user created; please change this password"
+        );
+    }
+
     let bind = SocketAddr::new(
         state.config.server.bind_ip.parse()?,
         state.config.server.bind_port,
     );
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
-    info!(%bind, "starting ma-server (phase 3: http + sendspin + providers)");
+    info!(%bind, "starting ma-server (phase 5: full http + ws + auth + commands)");
 
-    // Build the provider registry. Phase 3 only instantiates the
-    // built-in / configured providers when their config blocks are
-    // populated — advanced deployments will switch this for a
-    // real config loader.
-    let registry = ma_providers::provider::ProviderRegistry::new();
-    register_builtin_providers(&registry, &config);
-    let registry_arc = Arc::new(registry);
     info!(
-        providers = registry_arc.list().len(),
-        "providers registered"
+        sync_groups = player_controller.sync_groups.read().len(),
+        universal_groups = player_controller.universal_groups.read().len(),
+        bridges = player_controller.bridges.read().len(),
+        "player controller ready"
     );
 
     // Spawn the Sendspin WebSocket server on its own port (default 8927).
@@ -140,25 +187,14 @@ pub async fn run(config: MassConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Phase 3 builtin / example provider set. Wires the four provider
-/// crates that always work without external credentials:
-///
-/// * `filesystem_local` (when `MA_FS_PATH` is set)
-/// * `radiobrowser` (public API, no key)
-/// * `cover_art` (works with just the iTunes + Musicbrainz clients)
-/// * `spotify` (only if `MA_SPOTIFY_REFRESH_TOKEN` is set; otherwise
-///   the provider isn't registered)
-///
-/// This is the Rust equivalent of the Python server's
-/// `default_providers` list. It runs at startup; production
-/// deployments will replace it with a config-driven loader.
+/// Builtin / example provider set. Wires the provider crates that
+/// always work without external credentials (filesystem, radiobrowser,
+/// cover, spotify if a refresh token is present, s3 if MA_S3_BUCKET is
+/// set).
 fn register_builtin_providers(
     registry: &ma_providers::provider::ProviderRegistry,
     _config: &MassConfig,
 ) {
-    // Filesystem local — when MA_FS_PATH is set, register a single
-    // instance. The MA webserver config can carry multiple paths in
-    // the future.
     if let Ok(path) = std::env::var("MA_FS_PATH") {
         let fs_cfg = ma_provider_filesystem::FilesystemConfig {
             path: std::path::PathBuf::from(path),
@@ -173,7 +209,6 @@ fn register_builtin_providers(
         }
     }
 
-    // RadioBrowser — always available.
     match ma_provider_radio::RadioBrowserProvider::new() {
         Ok(provider) => {
             let handle = provider.into_handle("radiobrowser".into());
@@ -186,8 +221,6 @@ fn register_builtin_providers(
         Err(e) => tracing::warn!(error = ?e, "radiobrowser init failed"),
     }
 
-    // Cover art — always available, in-memory cache so we don't
-    // touch the filesystem unless the user has set MA_CACHE_DIR.
     let cover_cfg = ma_provider_cover::CoverConfig {
         prefer_musicbrainz: true,
         ..Default::default()
@@ -204,9 +237,6 @@ fn register_builtin_providers(
         Err(e) => tracing::warn!(error = ?e, "cover_art init failed"),
     }
 
-    // Spotify — only if a refresh token is provided. Auth without
-    // one would require an interactive PKCE flow, which Phase 3
-    // doesn't surface in the UI yet.
     if let Ok(refresh) = std::env::var("MA_SPOTIFY_REFRESH_TOKEN") {
         let cfg = ma_provider_spotify::SpotifyConfig {
             refresh_token: Some(refresh),
@@ -222,6 +252,22 @@ fn register_builtin_providers(
                 }
             }
             Err(e) => tracing::warn!(error = ?e, "spotify init failed"),
+        }
+    }
+
+    // S3 music source — opt-in via envvars.
+    if let Some(s3_cfg) = ma_provider_s3::S3Config::from_env() {
+        let instance = std::env::var("MA_S3_INSTANCE").unwrap_or_else(|_| "s3".into());
+        match ma_provider_s3::S3Provider::new(instance.clone(), s3_cfg) {
+            Ok(provider) => {
+                let handle = provider.into_handle(instance);
+                if let Err(e) = registry.register(handle) {
+                    tracing::warn!(error = ?e, "s3 register failed");
+                } else {
+                    tracing::info!(domain = "s3", "registered");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "s3 init failed"),
         }
     }
 }

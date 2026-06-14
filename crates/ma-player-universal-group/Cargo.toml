@@ -1,0 +1,22 @@
+[package]
+name = "ma-player-universal-group"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Universal Group player: a multi-provider fan-out sink that streams one source to many members. Phase 4 of the Rust port."
+
+[dependencies]
+ma-core = { path = "../ma-core" }
+ma-player-sync-group = { path = "../ma-player-sync-group" }
+ma-streams = { path = "../ma-streams" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }

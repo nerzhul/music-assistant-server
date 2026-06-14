@@ -17,11 +17,19 @@ ma-core = { path = "../ma-core" }
 ma-config = { path = "../ma-config" }
 ma-runtime = { path = "../ma-runtime" }
 ma-player-sendspin = { path = "../ma-player-sendspin" }
+ma-player-sync-group = { path = "../ma-player-sync-group" }
+ma-player-universal-group = { path = "../ma-player-universal-group" }
+ma-player-bridge = { path = "../ma-player-bridge" }
 ma-providers = { path = "../ma-providers" }
 ma-provider-filesystem = { path = "../ma-provider-filesystem" }
 ma-provider-radio = { path = "../ma-provider-radio" }
 ma-provider-spotify = { path = "../ma-provider-spotify" }
+ma-provider-s3 = { path = "../ma-provider-s3" }
 ma-provider-cover = { path = "../ma-provider-cover" }
+ma-cache-s3 = { path = "../ma-cache-s3" }
+
+uuid = { workspace = true }
+anyhow = { workspace = true }
 
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -31,13 +39,17 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
 async-trait = { workspace = true }
+parking_lot = { workspace = true }
+argon2 = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }
 tower = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }

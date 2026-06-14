@@ -1,9 +1,16 @@
 //! Player struct mirroring `music_assistant_models.player.Player`.
 //!
-//! This is the public, JSON-serialized form of a player that the UI consumes.
+//! This is the public, JSON-serialized form of a player that the UI
+//! consumes. The `Player` trait below is the minimal in-process
+//! surface that the sync-group / universal-group / bridge player
+//! crates need: enough to read state, issue playback commands, and
+//! query the protocols a player supports for grouping. The full
+//! Python `Player` class is ~3000 lines; we expose only the
+//! method shape the Phase 4 crates need.
 
 use crate::enums::*;
 use crate::identifiers::PlayerId;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -39,6 +46,49 @@ pub struct Player {
     pub display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+}
+
+/// What the sync-group / universal-group crates need to know about a
+/// real (or synthetic) player. The full Player state lives on the
+/// implementer; the trait just exposes the commands they need to
+/// issue and the queries they need to make.
+#[async_trait]
+pub trait PlayerControl: std::fmt::Debug + Send + Sync {
+    /// Stable player id.
+    fn player_id(&self) -> &str;
+    /// Provider domain (e.g. `"sendspin"`, `"syncgroup"`,
+    /// `"universal_group"`, `"bridge"`).
+    fn provider_domain(&self) -> &str;
+    /// Snapshot of the player's state.
+    fn state(&self) -> Player;
+    /// Whether this player supports grouping with players of
+    /// `other_domain`. The Python `can_group_with` set lives on the
+    /// Player struct, so the trait method just delegates.
+    fn can_group_with(&self, other_domain: &str) -> bool;
+    /// Whether this player requires flow mode (i.e. can only consume
+    /// `/flow/...` streams, not `/single/...`).
+    fn requires_flow_mode(&self) -> bool;
+    /// Display name (UI label).
+    fn display_name(&self) -> &str;
+    /// Group the player with `leader_id`. Implementation-specific:
+    /// the Sendspin crate will tell the leader to add the follower
+    /// via the protocol, the universal-group crate will record the
+    /// player in its `current_members`, etc.
+    async fn group_with(&self, leader_id: &str) -> crate::Result<()>;
+    /// Remove the player from its current group. Pair of
+    /// `group_with`.
+    async fn ungroup(&self) -> crate::Result<()>;
+    /// Start playback.
+    async fn play(&self) -> crate::Result<()>;
+    /// Stop playback.
+    async fn stop(&self) -> crate::Result<()>;
+    /// Set volume (0..100).
+    async fn set_volume(&self, level: u32) -> crate::Result<()>;
+    /// Set mute.
+    async fn set_mute(&self, mute: bool) -> crate::Result<()>;
+    /// Set power (on/off). Some players (groups) have no opinion and
+    /// return Ok without doing anything.
+    async fn set_power(&self, on: bool) -> crate::Result<()>;
 }
 
 #[cfg(test)]

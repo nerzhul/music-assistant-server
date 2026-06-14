@@ -1,0 +1,24 @@
+[package]
+name = "ma-player-sync-group"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Sync group player: a leader-follower sync protocol coordinator. Phase 4 of the Rust port."
+
+[dependencies]
+ma-core = { path = "../ma-core" }
+ma-protocol-sendspin = { path = "../ma-protocol-sendspin" }
+ma-player-sendspin = { path = "../ma-player-sendspin" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+once_cell = { workspace = true }
+async-stream = "0.3"
