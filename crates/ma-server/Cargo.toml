@@ -1,0 +1,43 @@
+[package]
+name = "ma-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Music Assistant Rust server binary: HTTP API + WebSocket UI + log."
+
+[[bin]]
+name = "ma-server"
+path = "src/main.rs"
+
+[dependencies]
+ma-core = { path = "../ma-core" }
+ma-config = { path = "../ma-config" }
+ma-runtime = { path = "../ma-runtime" }
+ma-player-sendspin = { path = "../ma-player-sendspin" }
+ma-providers = { path = "../ma-providers" }
+ma-provider-filesystem = { path = "../ma-provider-filesystem" }
+ma-provider-radio = { path = "../ma-provider-radio" }
+ma-provider-spotify = { path = "../ma-provider-spotify" }
+ma-provider-cover = { path = "../ma-provider-cover" }
+
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tower = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }

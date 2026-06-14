@@ -1,0 +1,16 @@
+[package]
+name = "ma-protocol-sendspin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Sendspin Audio Protocol — serde message types and binary codec constants."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+ma-core = { path = "../ma-core" }

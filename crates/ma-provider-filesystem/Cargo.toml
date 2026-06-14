@@ -1,0 +1,35 @@
+[package]
+name = "ma-provider-filesystem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Filesystem music provider: scan + lofty tag parsing + m3u + playback read."
+
+[dependencies]
+ma-core = { path = "../ma-core" }
+ma-providers = { path = "../ma-providers" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+lofty = "0.21"
+walkdir = "2"
+sha1_smol = "1"
+base64 = { workspace = true }
+once_cell = { workspace = true }
+parking_lot = { workspace = true }
+regex = { workspace = true }
+hex = "0.4"
+sqlx = { workspace = true }
+async-stream = "0.3"
+rand = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "ma-time-filter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "2D Kalman time filter for Sendspin clock offset/drift estimation."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "ma-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Configuration loading for the Music Assistant Rust port."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+figment = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+toml = "0.8"
+anyhow = { workspace = true }

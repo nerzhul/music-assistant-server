@@ -1,0 +1,104 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ma-core",
+    "crates/ma-config",
+    "crates/ma-runtime",
+    "crates/ma-server",
+    "crates/ma-protocol-sendspin",
+    "crates/ma-time-filter",
+    "crates/ma-discovery",
+    "crates/ma-player-sendspin",
+    "crates/ma-providers",
+    "crates/ma-provider-filesystem",
+    "crates/ma-provider-radio",
+    "crates/ma-provider-spotify",
+    "crates/ma-provider-cover",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+repository = "https://github.com/music-assistant/music-assistant"
+publish = false
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.41", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# serde / json
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simd-json = { version = "0.13", features = ["serde-compat"] }
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+
+# HTTP
+axum = { version = "0.7", features = ["macros", "ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
+# logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# errors / utils
+thiserror = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+sha1 = "0.10"
+sha2 = "0.10"
+rand = "0.8"
+url = "2"
+urlencoding = "2"
+once_cell = "1"
+parking_lot = "0.12"
+
+# config
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# DB
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "macros", "chrono", "uuid"] }
+
+# crypto / auth
+argon2 = "0.5"
+jsonwebtoken = "9"
+
+# regex / glob for filters
+regex = "1"
+glob = "0.3"
+
+# allocator
+tikv-jemallocator = "0.6"
+
+# image processing
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+# provider crates
+lofty = "0.21"
+walkdir = "2"
+sha1_smol = "1"
+quick-xml = "0.36"
+scraper = "0.20"
+miniz_oxide = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = 1
