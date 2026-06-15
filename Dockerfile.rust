@@ -1,0 +1,152 @@
+# syntax=docker/dockerfile:1
+# ==============================================================================
+# Music Assistant — Rust port
+# ==============================================================================
+# Mirrors the layout of the Python `Dockerfile` / `Dockerfile.base`:
+#   1. `rust-builder`  — compiles the release binary in a slim Rust image
+#   2. `final`         — inherits from the upstream `ghcr.io/music-assistant/base`
+#                        (which provides FFmpeg 7.1 with full codec support,
+#                        libjemalloc, libssl, libsqlite3, libnfs, etc.) and
+#                        installs the runtime-only additions: `yt-dlp` for the
+#                        YT Music provider + `ca-certificates`.
+# ==============================================================================
+
+ARG BASE_IMAGE_VERSION=latest
+ARG RUST_VERSION=1.83
+ARG TARGETARCH
+
+# ------------------------------------------------------------------------------
+# 1. Builder: compile the release binary.
+# ------------------------------------------------------------------------------
+FROM rust:${RUST_VERSION}-bookworm AS rust-builder
+
+# System deps for the `sqlx` bundled SQLite/Postgres builds. No
+# `libsqlite3-dev` / `libpq-dev` are technically required because
+# `libsqlite3-sys` / `libpq-sys` carry their own C sources, but
+# `pkg-config` and a C toolchain are still needed.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Pre-cache deps by copying manifests first. This is the standard
+# `cargo-chef` substitute for a single-crate workspace: the
+# `Cargo.toml` + `Cargo.lock` are stable across code-only changes.
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+
+# `cargo build --release` for the server binary. `--locked` pins
+# the Cargo.lock so the CI / local builds stay reproducible.
+RUN cargo build --release --locked -p ma-server
+
+# Strip the binary to shave ~50 MiB off the final image. The Rust
+# toolchain ships `strip`; on Alpine the equivalent is `llvm-strip`.
+RUN strip --strip-unneeded /build/target/release/ma-server
+
+# ------------------------------------------------------------------------------
+# 2. yt-dlp fetcher. Pulled at build time so the version is pinned
+#    and we don't rely on `pip` or `pipx` at runtime.
+# ------------------------------------------------------------------------------
+FROM debian:bookworm-slim AS ytdlp-fetcher
+
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# yt-dlp ships standalone static binaries per arch. The naming
+# convention is `yt-dlp_linux` (glibc) / `yt-dlp_musllinux` (musl).
+# We default to the glibc variant because the base image is
+# Debian bookworm.
+ARG YTDLP_VERSION=2026.06.09
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) YTDLP_FILE=yt-dlp_linux ;; \
+        arm64) YTDLP_FILE=yt-dlp_linux_aarch64 ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}" && exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/yt-dlp \
+        "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/${YTDLP_FILE}"; \
+    chmod +x /usr/local/bin/yt-dlp; \
+    /usr/local/bin/yt-dlp --version
+
+# ------------------------------------------------------------------------------
+# 3. Final image. Starts from the upstream base (FFmpeg 7.1 with
+#    fdk-aac/mp3lame/opus/vorbis/soxr, libjemalloc, libssl, libsqlite3,
+#    libnfs, libbluray, ...). Adds:
+#      - the ma-server binary (from `rust-builder`)
+#      - `yt-dlp` (from `ytdlp-fetcher`)
+# ------------------------------------------------------------------------------
+FROM ghcr.io/music-assistant/base:${BASE_IMAGE_VERSION} AS final
+
+# Pull the binary + the helper.
+COPY --from=rust-builder /build/target/release/ma-server /usr/local/bin/ma-server
+COPY --from=ytdlp-fetcher /usr/local/bin/yt-dlp /usr/local/bin/yt-dlp
+
+# `ca-certificates` is already in the base image, but we re-assert
+# it here so a base-image upgrade that drops the package is caught
+# at build time rather than at first-TLS-handshake time.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-ca-certificates
+
+# /data is the MA data directory (sqlite file, cache, music library).
+# /config is the standard HA-addon mount point; the server reads
+# `MA_DATA_DIR` if set but defaults to `/data`.
+VOLUME [ "/data" ]
+
+# Default port for the HTTP/WS webserver (music-assistant UI).
+# Sendspin uses 8927 (inbound) and 8928 (outbound); streams 8097.
+EXPOSE 8095 8097 8927 8928
+
+# Workdir doesn't matter for the binary; the entrypoint script
+# chdir's into the data dir before exec.
+WORKDIR /data
+
+# Entrypoint: enable jemalloc for the main process (Python reference
+# does the same via `LD_PRELOAD`). The shell snippet mirrors the
+# Python Dockerfile's `entrypoint.sh`.
+RUN printf '#!/bin/sh\n\
+set -eu\n\
+# jemalloc: envvar override OR fall back to the first .so we find.\n\
+if [ -z "${LD_PRELOAD:-}" ]; then\n\
+    for path in /usr/lib/*/libjemalloc.so.2; do\n\
+        [ -f "$path" ] && export LD_PRELOAD="$path" && break\n\
+    done\n\
+fi\n\
+# Default data dir if unset.\n\
+: "${MA_DATA_DIR:=/data}"\n\
+mkdir -p "${MA_DATA_DIR}/.cache" "${MA_DATA_DIR}/logs"\nexec ma-server\n' \
+    > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+
+# OCI labels (mirrors the Python image).
+ARG MASS_VERSION=0.1.0
+ARG TARGETPLATFORM
+LABEL \
+    org.opencontainers.image.title="Music Assistant Server (Rust)" \
+    org.opencontainers.image.description="Music Assistant is a free, opensource Media library manager that connects to your streaming services and a wide range of connected speakers. The server is the beating heart, the core of Music Assistant and must run on an always-on device like a Raspberry Pi, a NAS or an Intel NUC or alike." \
+    org.opencontainers.image.source="https://github.com/music-assistant/server" \
+    org.opencontainers.image.authors="The Music Assistant Team" \
+    org.opencontainers.image.documentation="https://music-assistant.io" \
+    org.opencontainers.image.licenses="Apache License 2.0" \
+    io.hass.version="${MASS_VERSION}" \
+    io.hass.name="Music Assistant Server (Rust)" \
+    io.hass.description="Music Assistant Server (Rust port)" \
+    io.hass.platform="${TARGETPLATFORM}" \
+    io.hass.type="addon"
+
+# Healthcheck: the webserver exposes `/info` which doesn't require
+# auth. The first request after boot may take ~100 ms while the DB
+# pool is opened and Sendspin is bound, so we give it a generous
+# start-period.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS http://localhost:8095/info >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

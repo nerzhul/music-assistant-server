@@ -24,6 +24,7 @@ members = [
     "crates/ma-provider-podcasts",
     "crates/ma-provider-ytmusic",
     "crates/ma-ha",
+    "crates/ma-library",
 ]
 
 [workspace.package]

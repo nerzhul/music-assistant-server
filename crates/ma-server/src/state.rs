@@ -23,6 +23,10 @@ pub struct AppState {
     /// `None` when the in-memory auth backend is used (tests); `Some`
     /// when a `ma_storage::Database` is configured.
     pub database: Option<Arc<ma_storage::Database>>,
+    /// `None` when no DB is open; `Some` once a `LibraryRepository`
+    /// was successfully built (which requires both a DB and
+    /// `ma-storage`'s migrations to have been applied).
+    pub library_controller: Option<Arc<ma_library::LibraryController>>,
 }
 
 impl AppState {
@@ -40,6 +44,7 @@ impl AppState {
             commands,
             providers,
             database: None,
+            library_controller: None,
         }
     }
 
@@ -53,6 +58,15 @@ impl AppState {
     /// failed to open).
     pub fn with_database_opt(mut self, db: Option<Arc<ma_storage::Database>>) -> Self {
         self.database = db;
+        self
+    }
+
+    /// Attach a `LibraryController`. The DB must already be wired
+    /// (i.e. `with_database_opt` was called). We keep this a
+    /// separate setter so callers can build the controller
+    /// opportunistically (or skip it when no DB is open).
+    pub fn with_library_controller(mut self, ctrl: Arc<ma_library::LibraryController>) -> Self {
+        self.library_controller = Some(ctrl);
         self
     }
 }

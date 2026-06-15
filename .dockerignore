@@ -1,0 +1,38 @@
+# Docker build context exclusion. The Rust Dockerfile already copies
+# exactly what it needs (Cargo.toml + crates/), but having an
+# explicit `.dockerignore` keeps `docker build` fast and prevents
+# accidentally baking in build artifacts, the local SQLite DB, etc.
+#
+# Patterns overlap with `.gitignore`; this file is read by `docker
+# build` only and has no effect on git itself.
+
+# Local build artifacts
+target/
+**/target/
+build/
+dist/
+
+# Local data
+*.db
+*.db-shm
+*.db-wal
+data/
+.cache/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+**/tests/.tmp/
+coverage/
+*.profraw
+
+# The Rust source itself is included — only the build outputs are
+# excluded. We deliberately keep:
+#   * Cargo.toml, Cargo.lock
+#   * crates/ (the entire workspace)
+#   * Dockerfile.rust
+#   * .dockerignore

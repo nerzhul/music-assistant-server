@@ -29,6 +29,7 @@ ma-provider-cover = { path = "../ma-provider-cover" }
 ma-provider-podcasts = { path = "../ma-provider-podcasts" }
 ma-provider-ytmusic = { path = "../ma-provider-ytmusic" }
 ma-ha = { path = "../ma-ha" }
+ma-library = { path = "../ma-library" }
 ma-cache-s3 = { path = "../ma-cache-s3" }
 ma-storage = { path = "../ma-storage" }
 

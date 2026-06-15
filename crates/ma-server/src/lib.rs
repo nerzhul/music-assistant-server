@@ -168,6 +168,14 @@ pub async fn run(config: MassConfig) -> anyhow::Result<()> {
         registry_arc.clone(),
     );
     state = state.with_database_opt(database.clone());
+    // If we have a database, also build a `LibraryController` so
+    // the `library/*` commands + the filesystem auto-indexer can
+    // upsert tracks / albums / artists / provider_mappings.
+    if let Some(db) = database.as_ref() {
+        let repo = ma_storage::LibraryRepository::new(db.pool().clone());
+        let lib_ctrl = Arc::new(ma_library::LibraryController::new(repo));
+        state = state.with_library_controller(lib_ctrl);
+    }
     let state = Arc::new(state);
 
     // If we have a database, hydrate the in-memory auth state from
@@ -225,6 +233,34 @@ pub async fn run(config: MassConfig) -> anyhow::Result<()> {
         bridges = player_controller.bridges.read().len(),
         "player controller ready"
     );
+
+    // Library auto-index: if `MA_FS_PATH` is set and a DB is open,
+    // spawn a one-shot task that scans the path and upserts tracks
+    // into the library. Skipped when the DB is not configured.
+    if let (Ok(fs_path), Some(lib_ctrl)) = (
+        std::env::var("MA_FS_PATH"),
+        state.library_controller.as_ref(),
+    ) {
+        let lib_ctrl = Arc::clone(lib_ctrl);
+        let path = std::path::PathBuf::from(fs_path);
+        tokio::spawn(async move {
+            match lib_ctrl
+                .index_filesystem(&path, &ma_library::controller::IndexOptions::default())
+                .await
+            {
+                Ok(summary) => info!(
+                    base = %path.display(),
+                    scanned = summary.files_scanned,
+                    parsed = summary.tracks_parsed,
+                    persisted = summary.tracks_persisted,
+                    failed = summary.tracks_failed,
+                    duration_secs = summary.duration.as_secs_f64(),
+                    "library: auto-index complete"
+                ),
+                Err(e) => tracing::warn!(error = %e, "library: auto-index failed"),
+            }
+        });
+    }
 
     // Spawn the Sendspin WebSocket server on its own port (default 8927).
     if config.sendspin.enabled {
@@ -453,20 +489,24 @@ async fn consume_ha_snapshots(
     ctrl: Arc<PlayerController>,
     client: Arc<ma_ha::HaClient>,
 ) {
+    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut snapshots_processed: u64 = 0;
     while let Ok(snapshot) = rx.recv().await {
+        snapshots_processed += 1;
         let new_ids: std::collections::HashSet<String> = snapshot
             .iter()
             .map(|s| s.entity.entity_id.clone())
             .collect();
         // Register new entities.
+        let mut added: Vec<String> = Vec::new();
+        let mut refreshed: Vec<String> = Vec::new();
         for s in &snapshot {
-            let id = &s.entity.entity_id;
+            let id = s.entity.entity_id.clone();
             let already = ctrl
                 .ha_players
                 .read()
                 .contains_key(&ma_core::identifiers::PlayerId::from(id.clone()));
             if already {
-                // Refresh the existing player in place.
                 if let Some(player) = ctrl
                     .ha_players
                     .read()
@@ -475,28 +515,61 @@ async fn consume_ha_snapshots(
                 {
                     player.update_from_entity(&s.entity);
                 }
+                refreshed.push(id);
             } else {
                 let friendly = friendly_name(&s.entity);
                 let player = ma_ha::HaPlayer::new(id.clone(), friendly, Arc::clone(&client));
                 player.update_from_entity(&s.entity);
-                ctrl.register_ha_player(id, player);
+                ctrl.register_ha_player(&id, player);
+                added.push(id);
             }
+        }
+        if !added.is_empty() {
+            tracing::info!(
+                count = added.len(),
+                entities = ?added,
+                "ha: registered new media_player entities"
+            );
+        }
+        if !refreshed.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
+            // Only emit at DEBUG: HA can poll every 30s and this
+            // would flood the log.
+            tracing::debug!(
+                count = refreshed.len(),
+                "ha: refreshed existing media_player entities"
+            );
         }
         // Unregister entities that disappeared.
-        let current_ids: Vec<String> = ctrl
-            .ha_players
-            .read()
-            .keys()
-            .map(|k| k.to_string())
-            .collect();
-        for id in current_ids {
-            if !new_ids.contains(&id) {
-                ctrl.unregister_ha_player(&id);
-                tracing::info!(entity_id = %id, "ha player unregistered");
+        let mut removed: Vec<String> = Vec::new();
+        for id in known.iter() {
+            if !new_ids.contains(id) {
+                removed.push(id.clone());
             }
         }
+        for id in &removed {
+            ctrl.unregister_ha_player(id);
+        }
+        if !removed.is_empty() {
+            tracing::info!(
+                count = removed.len(),
+                entities = ?removed,
+                "ha: unregistered media_player entities (gone from HA)"
+            );
+        }
+        // Drop the old known set and rebuild it from the current
+        // snapshot. We do this in a single assignment so a brief
+        // empty snapshot doesn't accidentally clear all players.
+        known = new_ids;
+        // Once-per-snapshot summary at INFO; useful for ops.
+        if snapshots_processed == 1 {
+            tracing::info!(total_known = known.len(), "ha: first snapshot reconciled");
+        }
     }
-    tracing::info!("ha snapshot consumer exiting (channel closed)");
+    tracing::info!(
+        snapshots_processed,
+        last_known = known.len(),
+        "ha snapshot consumer exiting (channel closed)"
+    );
 }
 
 /// Pull a friendly display name from the entity's attributes

@@ -24,4 +24,7 @@ pub mod repos;
 pub use cover_art::CoverArtRecord;
 pub use error::{StorageError, StorageResult};
 pub use pool::{Database, DatabaseConfig, DatabaseKind};
-pub use repos::{AuthRepository, CoverArtRepository};
+pub use repos::{
+    AlbumRow, ArtistRow, AuthRepository, CoverArtRepository, LibraryRepository, PlaylistRow,
+    ProviderMappingRow, TrackRow,
+};
